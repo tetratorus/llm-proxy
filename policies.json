@@ -2,7 +2,7 @@
   "outbound": [
     {
       "name": "outbound-api-key-like-secret",
-      "pattern": "(sk-[A-Za-z0-9_-]{20,}|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|GEMINI_API_KEY|XAI_API_KEY|OPENROUTER_API_KEY)",
+      "pattern": "(sk-[A-Za-z0-9_-]{20,}|(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|GEMINI_API_KEY|XAI_API_KEY|OPENROUTER_API_KEY)\\s*=\\s*[\"']?[^\"'\\s]{12,})",
       "flags": "i",
       "hook_url": "http://127.0.0.1:8888/hooks/policy"
     }
@@ -10,7 +10,7 @@
   "inbound": [
     {
       "name": "inbound-api-key-like-secret",
-      "pattern": "(sk-[A-Za-z0-9_-]{20,}|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|GEMINI_API_KEY|XAI_API_KEY|OPENROUTER_API_KEY)",
+      "pattern": "(sk-[A-Za-z0-9_-]{20,}|(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|GEMINI_API_KEY|XAI_API_KEY|OPENROUTER_API_KEY)\\s*=\\s*[\"']?[^\"'\\s]{12,})",
       "flags": "i",
       "hook_url": "http://127.0.0.1:8888/hooks/policy"
     },

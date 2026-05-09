@@ -150,6 +150,51 @@ test('provider env auth overrides incoming client auth', () => {
   }
 });
 
+test('unsupported encoded request bodies are forwarded as raw bytes', async () => {
+  const previousBase = PROVIDERS.openai.upstreamBase;
+  const previousKey = process.env.OPENAI_API_KEY;
+  const rawBody = Buffer.from('not-really-zstd-but-must-stay-raw');
+  let upstreamEncoding = null;
+  let upstreamBody = null;
+
+  const upstream = http.createServer((req, res) => {
+    upstreamEncoding = req.headers['content-encoding'];
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      upstreamBody = Buffer.concat(chunks);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  process.env.OPENAI_API_KEY = 'test-env-http-key';
+
+  try {
+    const response = await fetch(`${baseUrl}/openai/responses`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-encoding': 'zstd',
+      },
+      body: rawBody,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(upstreamEncoding, 'zstd');
+    assert.equal(Buffer.compare(upstreamBody, rawBody), 0);
+  } finally {
+    PROVIDERS.openai.upstreamBase = previousBase;
+    if (previousKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousKey;
+    }
+    await new Promise(resolve => upstream.close(resolve));
+  }
+});
+
 test('websocket frames are logged separately and searchable', async () => {
   const previousBase = PROVIDERS.openai.upstreamBase;
   const previousKey = process.env.OPENAI_API_KEY;
@@ -308,15 +353,12 @@ test('policy hooks receive outbound and inbound websocket matches with context',
 
     assert.ok(outbound, 'expected outbound hook event');
     assert.ok(inbound, 'expected inbound hook event');
-    assert.equal(outbound.direction, 'outbound');
-    assert.equal(inbound.direction, 'inbound');
-    assert.equal(outbound.transport, 'websocket');
-    assert.equal(inbound.transport, 'websocket');
-    assert.equal(outbound.provider, 'openai');
-    assert.equal(Boolean(outbound.request_id), true);
-    assert.equal(Boolean(outbound.frame_id), true);
-    assert.equal(outbound.payload_snippet.includes(outboundMarker), true);
-    assert.equal(inbound.payload_snippet.includes(inboundMarker), true);
+    assert.equal(Object.keys(outbound).sort().join(','), 'offending_text,rule,text');
+    assert.equal(Object.keys(inbound).sort().join(','), 'offending_text,rule,text');
+    assert.equal(outbound.offending_text, outboundMarker);
+    assert.equal(inbound.offending_text, inboundMarker);
+    assert.equal(outbound.text.includes(outboundMarker), true);
+    assert.equal(inbound.text.includes(inboundMarker), true);
   } finally {
     PROVIDERS.openai.upstreamBase = previousBase;
     if (previousKey === undefined) {
@@ -346,7 +388,7 @@ test('policy hook denial blocks matching outbound HTTP requests', async () => {
     req.resume();
     req.on('end', () => {
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ allow: false, reason: 'test policy denied' }));
+      res.end(JSON.stringify({ allow: false, reason: 'test policy denied', comments: 'test policy comment' }));
     });
   });
   await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
@@ -379,6 +421,7 @@ test('policy hook denial blocks matching outbound HTTP requests', async () => {
     assert.equal(response.status, 403);
     assert.equal(body.error, 'Policy blocked outbound request');
     assert.equal(body.reason, 'test policy denied');
+    assert.equal(body.comments, 'test policy comment');
     assert.equal(upstreamSawRequest, false);
   } finally {
     PROVIDERS.openai.upstreamBase = previousBase;

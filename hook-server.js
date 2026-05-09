@@ -34,7 +34,9 @@ app.get('/events', (req, res) => {
 app.post('/hooks/policy', async (req, res) => {
   const event = {
     received_at: new Date().toISOString(),
-    ...req.body,
+    rule: req.body && req.body.rule,
+    text: req.body && req.body.text,
+    offending_text: req.body && req.body.offending_text,
   };
   events.push(event);
   while (events.length > maxEvents) events.shift();
@@ -46,12 +48,9 @@ app.post('/hooks/policy', async (req, res) => {
   console.log(JSON.stringify({
     received_at: event.received_at,
     rule: event.rule && event.rule.name,
-    direction: event.direction,
-    provider: event.provider,
-    request_id: event.request_id,
-    frame_id: event.frame_id,
-    match: event.match,
+    offending_text: event.offending_text,
     allowed: decision.allow,
+    comments: decision.comments,
     error: decision.error,
   }));
 
@@ -65,21 +64,12 @@ app.post('/hooks/policy', async (req, res) => {
 function buildTouchIDPrompt(event) {
   const parts = [
     `llm-proxy policy match: ${event.rule && event.rule.name ? event.rule.name : 'unnamed rule'}`,
-    `Direction: ${event.direction || 'unknown'}`,
-    `Transport: ${event.transport || 'unknown'}`,
-    `Provider: ${event.provider || 'unknown'}`,
-    `Endpoint: ${event.endpoint || 'unknown'}`,
+    `Offending text: ${stringOrEmpty(event.offending_text)}`,
   ];
 
-  if (event.frame) {
-    parts.push(`Frame: #${event.frame.sequence || '?'} ${event.frame.type || 'unknown'} ${event.frame.bytes || 0} bytes`);
-  }
-
-  parts.push(`Offending text: ${stringOrEmpty(event.match)}`);
-
-  const snippet = stringOrEmpty(event.payload_snippet);
-  if (snippet && snippet !== event.match) {
-    parts.push(`Context: ${snippet}`);
+  const text = stringOrEmpty(event.text);
+  if (text) {
+    parts.push(`Text: ${text}`);
   }
 
   return truncate(parts.join('\n'), TOUCHID_REASON_CHARS);
@@ -95,20 +85,23 @@ async function requestTouchID(prompt) {
     });
     const response = parseTouchIDResponse(stdout);
     if (response.confirmed === true) {
-      return { allow: true, confirmed: true };
+      return { allow: true, confirmed: true, comments: 'Touch ID confirmed' };
     }
     return {
       allow: false,
       confirmed: false,
       reason: response.error || 'Touch ID was not confirmed',
+      comments: response.error || 'Touch ID was not confirmed',
     };
   } catch (error) {
     const response = parseTouchIDResponse(error.stdout);
+    const message = response.error || error.message || 'Touch ID failed';
     return {
       allow: false,
       confirmed: false,
-      reason: response.error || error.message || 'Touch ID failed',
-      error: response.error || error.message || 'Touch ID failed',
+      reason: message,
+      comments: message,
+      error: message,
     };
   }
 }

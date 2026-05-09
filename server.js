@@ -19,6 +19,7 @@ const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.json';
 const POLICY_HOOK_URL = process.env.LLM_PROXY_POLICY_HOOK_URL || 'http://127.0.0.1:8888/hooks/policy';
 const POLICY_HOOK_TIMEOUT = Number(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || 60000);
 const POLICY_PAYLOAD_SNIPPET_LIMIT = Number(process.env.LLM_PROXY_POLICY_SNIPPET_CHARS || 4000);
+const BODY_LIMIT_BYTES = 50 * 1024 * 1024;
 
 const db = new Database(DB_PATH);
 
@@ -151,6 +152,7 @@ db.exec(`
 
 migrateInlineWebSocketFrames();
 
+app.use(readUnsupportedEncodedBody);
 app.use(express.json({ limit: '50mb', type: ['application/json', 'application/*+json'] }));
 app.use(express.text({ limit: '50mb', type: ['text/*', 'application/x-ndjson'] }));
 app.use(express.raw({
@@ -169,6 +171,28 @@ app.use(express.static('.'));
 function normalizePath(path) {
   if (!path) return '/';
   return path.startsWith('/') ? path : `/${path}`;
+}
+
+function readUnsupportedEncodedBody(req, res, next) {
+  const encoding = String(req.headers['content-encoding'] || 'identity').toLowerCase().trim();
+  if (!['zstd', 'zst'].includes(encoding)) return next();
+
+  let size = 0;
+  const chunks = [];
+  req.on('data', chunk => {
+    size += chunk.length;
+    if (size > BODY_LIMIT_BYTES) {
+      res.status(413).json({ error: 'Request body too large' });
+      req.destroy();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => {
+    req.body = Buffer.concat(chunks);
+    next();
+  });
+  req.on('error', next);
 }
 
 function joinUrl(base, path) {
@@ -466,6 +490,10 @@ function buildUpstreamHeaders(req, provider, options = {}) {
 
   Object.assign(headers, provider.config.extraHeaders ? provider.config.extraHeaders(req) : {});
 
+  if (Buffer.isBuffer(req.body) && req.headers['content-encoding']) {
+    headers['content-encoding'] = req.headers['content-encoding'];
+  }
+
   for (const [key, value] of Object.entries(headers)) {
     if (value === undefined) delete headers[key];
   }
@@ -632,26 +660,30 @@ function updateWebSocketSummary({ requestId, clientFrames, serverFrames, statusC
   );
 }
 
-function insertPolicyEvent({ requestId, frameId, direction, rule, hookUrl, status, error, payloadSnippet }) {
+function insertPolicyEvent({ rule, hookUrl, status, error, text, offendingText }) {
   db.prepare(`
     INSERT INTO policy_events (
       request_id, frame_id, direction, rule_name, pattern, hook_url, status, error, payload_snippet
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    requestId,
-    frameId || null,
-    direction,
+    null,
+    null,
+    null,
     rule.name,
     rule.pattern,
     hookUrl,
     status,
     error || null,
-    payloadSnippet
+    JSON.stringify({
+      rule: rule.name,
+      text,
+      offending_text: offendingText,
+    })
   );
 }
 
-async function postPolicyHook(hookUrl, event) {
+async function postPolicyHook(hookUrl, hookPayload) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), POLICY_HOOK_TIMEOUT);
 
@@ -659,7 +691,7 @@ async function postPolicyHook(hookUrl, event) {
     const response = await fetch(hookUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(event),
+      body: JSON.stringify(hookPayload),
       signal: controller.signal,
     });
 
@@ -673,31 +705,28 @@ async function postPolicyHook(hookUrl, event) {
 
     const allowed = response.ok && body.allow === true;
     insertPolicyEvent({
-      requestId: event.request_id,
-      frameId: event.frame_id,
-      direction: event.direction,
-      rule: event.rule,
+      rule: hookPayload.rule,
       hookUrl,
       status: allowed ? 'allowed' : (response.ok ? 'denied' : `http_${response.status}`),
-      error: allowed ? null : (body.reason || body.error || null),
-      payloadSnippet: event.payload_snippet,
+      error: allowed ? null : (body.reason || body.error || body.comments || null),
+      text: hookPayload.text,
+      offendingText: hookPayload.offending_text,
     });
 
     return {
       allowed,
       reason: body.reason || body.error || (allowed ? null : `Hook returned HTTP ${response.status}`),
+      comments: typeof body.comments === 'string' ? body.comments : null,
     };
   } catch (error) {
     clearTimeout(timeout);
     insertPolicyEvent({
-      requestId: event.request_id,
-      frameId: event.frame_id,
-      direction: event.direction,
-      rule: event.rule,
+      rule: hookPayload.rule,
       hookUrl,
       status: 'failed',
       error: error.message,
-      payloadSnippet: event.payload_snippet,
+      text: hookPayload.text,
+      offendingText: hookPayload.offending_text,
     });
     return { allowed: false, reason: error.message };
   }
@@ -712,41 +741,24 @@ async function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, ups
     const match = rule.regex.exec(payload);
     if (!match) continue;
 
-    const event = {
-      event: 'policy.match',
-      timestamp: new Date().toISOString(),
-      policy_source: policyConfig.source,
-      request_id: requestId,
-      frame_id: frameId || null,
-      provider,
-      endpoint,
-      upstream_url: upstreamUrl,
-      direction,
-      transport,
-      frame: frame ? {
-        sequence: frame.sequence,
-        opcode: frame.opcode,
-        type: frame.type,
-        bytes: frame.bytes,
-      } : null,
+    const hookPayload = {
       rule: {
         name: rule.name,
         pattern: rule.pattern,
         flags: rule.flags,
       },
-      match: match[0],
-      match_index: match.index,
-      payload_bytes: Buffer.byteLength(payload),
-      payload_snippet: truncateText(payload, POLICY_PAYLOAD_SNIPPET_LIMIT),
+      text: payload,
+      offending_text: match[0],
     };
 
-    const decision = await postPolicyHook(rule.hookUrl, event);
+    const decision = await postPolicyHook(rule.hookUrl, hookPayload);
     if (!decision.allowed) {
       return {
         allowed: false,
         matched: true,
         rule: rule.name,
         reason: decision.reason || `Policy hook denied ${rule.name}`,
+        comments: decision.comments || null,
       };
     }
   }
@@ -892,7 +904,7 @@ function handleUpgrade(req, socket, head) {
       blocked = true;
       const reason = decision.reason || `Policy hook denied ${decision.rule || 'matched rule'}`;
       db.prepare('UPDATE requests SET response = ?, status_code = ?, response_time = ? WHERE id = ?')
-        .run(JSON.stringify({ error: 'Policy blocked WebSocket frame', reason }), 403, Date.now() - startTime, requestId);
+        .run(JSON.stringify({ error: 'Policy blocked WebSocket frame', reason, comments: decision.comments || null }), 403, Date.now() - startTime, requestId);
       console.error(`Policy blocked WebSocket request ${requestId}: ${reason}`);
       socket.end();
       upstreamSocket.end();
@@ -1118,6 +1130,7 @@ app.use(async (req, res, next) => {
       const responseText = JSON.stringify({
         error: 'Policy blocked outbound request',
         reason: outboundDecision.reason,
+        comments: outboundDecision.comments || null,
       });
       updateRequest({
         requestId,
@@ -1169,13 +1182,13 @@ app.use(async (req, res, next) => {
       if (!inboundDecision.allowed) {
         updateRequest({
           requestId,
-          responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason }),
+          responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null }),
           statusCode: 403,
           responseTime: Date.now() - startTime,
           model: originalModel,
           usage: null,
         });
-        return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason });
+        return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null });
       }
 
       forwardResponseHeaders(upstream, res);
@@ -1209,13 +1222,13 @@ app.use(async (req, res, next) => {
     if (!inboundDecision.allowed) {
       updateRequest({
         requestId,
-        responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason }),
+        responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null }),
         statusCode: 403,
         responseTime: Date.now() - startTime,
         model: originalModel,
         usage: null,
       });
-      return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason });
+      return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null });
     }
 
     forwardResponseHeaders(upstream, res);
