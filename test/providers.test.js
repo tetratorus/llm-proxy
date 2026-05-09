@@ -7,6 +7,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 process.env.REQUESTS_DB = path.join(os.tmpdir(), `llm-proxy-test-${process.pid}.db`);
+process.env.LLM_PROXY_POLICY_FILE = path.join(os.tmpdir(), `llm-proxy-policy-${process.pid}.json`);
 
 const { buildUpstreamHeaders, loadDotEnv, startServer, PROVIDERS } = require('../server');
 
@@ -233,6 +234,104 @@ test('websocket frames are logged separately and searchable', async () => {
   }
 });
 
+test('policy hooks receive outbound and inbound websocket matches with context', async () => {
+  const previousBase = PROVIDERS.openai.upstreamBase;
+  const previousKey = process.env.OPENAI_API_KEY;
+  const outboundMarker = `OUTBOUND_POLICY_${process.pid}_${Date.now()}`;
+  const inboundMarker = `INBOUND_POLICY_${process.pid}_${Date.now()}`;
+  const receivedHooks = [];
+  const upstreamSockets = new Set();
+
+  const hookServer = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/hooks/policy') {
+      res.writeHead(404).end();
+      return;
+    }
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      receivedHooks.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+  });
+  await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
+  const hookUrl = `http://127.0.0.1:${hookServer.address().port}/hooks/policy`;
+
+  fs.writeFileSync(process.env.LLM_PROXY_POLICY_FILE, JSON.stringify({
+    outbound: [{ name: 'test-outbound', pattern: outboundMarker, hook_url: hookUrl }],
+    inbound: [{ name: 'test-inbound', pattern: inboundMarker, hook_url: hookUrl }],
+  }));
+  await fetch(`${baseUrl}/api/policies/reload`, { method: 'POST' });
+
+  const upstream = http.createServer();
+  upstream.on('upgrade', (req, socket) => {
+    upstreamSockets.add(socket);
+    socket.on('close', () => upstreamSockets.delete(socket));
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    socket.write(websocketTextFrame(JSON.stringify({ marker: inboundMarker })));
+    setTimeout(() => socket.end(), 50);
+  });
+
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  process.env.OPENAI_API_KEY = 'test-env-ws-key';
+
+  try {
+    await new Promise((resolve, reject) => {
+      const client = net.connect(new URL(baseUrl).port, '127.0.0.1', () => {
+        client.write([
+          'GET /openai/realtime?model=test HTTP/1.1',
+          `Host: ${new URL(baseUrl).host}`,
+          'Connection: Upgrade',
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          'Authorization: Bearer client-key',
+          '',
+          '',
+        ].join('\r\n'));
+        setTimeout(() => {
+          client.write(websocketTextFrame(JSON.stringify({ marker: outboundMarker }), true));
+        }, 25);
+      });
+      setTimeout(() => {
+        client.destroy();
+        resolve();
+      }, 250);
+      client.on('error', reject);
+    });
+
+    await waitFor(() => receivedHooks.length >= 2);
+    const outbound = receivedHooks.find(event => event.rule.name === 'test-outbound');
+    const inbound = receivedHooks.find(event => event.rule.name === 'test-inbound');
+
+    assert.ok(outbound, 'expected outbound hook event');
+    assert.ok(inbound, 'expected inbound hook event');
+    assert.equal(outbound.direction, 'outbound');
+    assert.equal(inbound.direction, 'inbound');
+    assert.equal(outbound.transport, 'websocket');
+    assert.equal(inbound.transport, 'websocket');
+    assert.equal(outbound.provider, 'openai');
+    assert.equal(Boolean(outbound.request_id), true);
+    assert.equal(Boolean(outbound.frame_id), true);
+    assert.equal(outbound.payload_snippet.includes(outboundMarker), true);
+    assert.equal(inbound.payload_snippet.includes(inboundMarker), true);
+  } finally {
+    PROVIDERS.openai.upstreamBase = previousBase;
+    if (previousKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousKey;
+    }
+    for (const socket of upstreamSockets) socket.destroy();
+    await new Promise(resolve => upstream.close(resolve));
+    await new Promise(resolve => hookServer.close(resolve));
+    fs.rmSync(process.env.LLM_PROXY_POLICY_FILE, { force: true });
+    await fetch(`${baseUrl}/api/policies/reload`, { method: 'POST' });
+  }
+});
+
 test('.env loader overrides existing shell exports', () => {
   const envPath = path.join(os.tmpdir(), `llm-proxy-env-${process.pid}.env`);
   process.env.LLM_PROXY_ENV_PRIORITY_TEST = 'from-shell';
@@ -257,6 +356,15 @@ function parseJson(text, provider, providerPath, status) {
 
 function snippet(text) {
   return text.replace(/\s+/g, ' ').slice(0, 500);
+}
+
+async function waitFor(check, timeoutMs = 2000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (check()) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  throw new Error('condition was not met before timeout');
 }
 
 function websocketTextFrame(text, masked = false) {

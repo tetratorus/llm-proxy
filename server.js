@@ -15,6 +15,10 @@ const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 300000);
 const DB_PATH = process.env.REQUESTS_DB || 'requests.db';
 const WEBSOCKET_FRAME_PAYLOAD_LIMIT = Number(process.env.WEBSOCKET_FRAME_PAYLOAD_LIMIT_CHARS || 1000000);
 const WEBSOCKET_SEARCH_SNIPPET_LIMIT = Number(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || 500);
+const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.json';
+const POLICY_HOOK_URL = process.env.LLM_PROXY_POLICY_HOOK_URL || 'http://127.0.0.1:8888/hooks/policy';
+const POLICY_HOOK_TIMEOUT = Number(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || 2000);
+const POLICY_PAYLOAD_SNIPPET_LIMIT = Number(process.env.LLM_PROXY_POLICY_SNIPPET_CHARS || 4000);
 
 const db = new Database(DB_PATH);
 
@@ -127,6 +131,24 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_ws_frames_payload ON websocket_frames(payload);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS policy_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    request_id TEXT,
+    frame_id INTEGER,
+    direction TEXT,
+    rule_name TEXT,
+    pattern TEXT,
+    hook_url TEXT,
+    status TEXT,
+    error TEXT,
+    payload_snippet TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_policy_events_request ON policy_events(request_id, timestamp);
+`);
+
 migrateInlineWebSocketFrames();
 
 app.use(express.json({ limit: '50mb', type: ['application/json', 'application/*+json'] }));
@@ -189,6 +211,55 @@ function loadDotEnv(path = '.env') {
     }
     process.env[match[1]] = value;
   }
+}
+
+function loadPolicyConfig() {
+  const candidatePaths = [POLICY_FILE];
+  if (POLICY_FILE !== 'policies.example.json') candidatePaths.push('policies.example.json');
+
+  for (const path of candidatePaths) {
+    if (!fs.existsSync(path)) continue;
+    try {
+      const raw = JSON.parse(fs.readFileSync(path, 'utf8'));
+      return {
+        source: path,
+        outbound: compilePolicyRules(raw.outbound || []),
+        inbound: compilePolicyRules(raw.inbound || []),
+      };
+    } catch (error) {
+      console.error(`Failed to load policy file ${path}:`, error.message);
+      return { source: path, outbound: [], inbound: [] };
+    }
+  }
+
+  return { source: null, outbound: [], inbound: [] };
+}
+
+function compilePolicyRules(rules) {
+  return rules
+    .filter(rule => rule && rule.enabled !== false && rule.pattern)
+    .map(rule => {
+      try {
+        return {
+          name: rule.name || 'unnamed-policy',
+          pattern: rule.pattern,
+          flags: rule.flags || 'i',
+          hookUrl: rule.hook_url || POLICY_HOOK_URL,
+          regex: new RegExp(rule.pattern, rule.flags || 'i'),
+        };
+      } catch (error) {
+        console.error(`Invalid policy regex ${rule.name || rule.pattern}:`, error.message);
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+let policyConfig = loadPolicyConfig();
+
+function reloadPolicyConfig() {
+  policyConfig = loadPolicyConfig();
+  return policyConfig;
 }
 
 function generateConversationId(body) {
@@ -550,7 +621,105 @@ function updateWebSocketSummary({ requestId, clientFrames, serverFrames, statusC
   );
 }
 
-function createWebSocketLogWriter(requestId, startTime) {
+function insertPolicyEvent({ requestId, frameId, direction, rule, hookUrl, status, error, payloadSnippet }) {
+  db.prepare(`
+    INSERT INTO policy_events (
+      request_id, frame_id, direction, rule_name, pattern, hook_url, status, error, payload_snippet
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    requestId,
+    frameId || null,
+    direction,
+    rule.name,
+    rule.pattern,
+    hookUrl,
+    status,
+    error || null,
+    payloadSnippet
+  );
+}
+
+function postPolicyHook(hookUrl, event) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), POLICY_HOOK_TIMEOUT);
+
+  fetch(hookUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(event),
+    signal: controller.signal,
+  })
+    .then(response => {
+      clearTimeout(timeout);
+      insertPolicyEvent({
+        requestId: event.request_id,
+        frameId: event.frame_id,
+        direction: event.direction,
+        rule: event.rule,
+        hookUrl,
+        status: response.ok ? 'sent' : `http_${response.status}`,
+        error: null,
+        payloadSnippet: event.payload_snippet,
+      });
+    })
+    .catch(error => {
+      clearTimeout(timeout);
+      insertPolicyEvent({
+        requestId: event.request_id,
+        frameId: event.frame_id,
+        direction: event.direction,
+        rule: event.rule,
+        hookUrl,
+        status: 'failed',
+        error: error.message,
+        payloadSnippet: event.payload_snippet,
+      });
+    });
+}
+
+function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, upstreamUrl, direction, transport, frame, payload }) {
+  const rules = direction === 'outbound' ? policyConfig.outbound : policyConfig.inbound;
+  if (!rules.length || typeof payload !== 'string') return;
+
+  for (const rule of rules) {
+    rule.regex.lastIndex = 0;
+    const match = rule.regex.exec(payload);
+    if (!match) continue;
+
+    const event = {
+      event: 'policy.match',
+      timestamp: new Date().toISOString(),
+      policy_source: policyConfig.source,
+      request_id: requestId,
+      frame_id: frameId || null,
+      provider,
+      endpoint,
+      upstream_url: upstreamUrl,
+      direction,
+      transport,
+      frame: frame ? {
+        sequence: frame.sequence,
+        opcode: frame.opcode,
+        type: frame.type,
+        bytes: frame.bytes,
+      } : null,
+      rule: {
+        name: rule.name,
+        pattern: rule.pattern,
+        flags: rule.flags,
+      },
+      match: match[0],
+      match_index: match.index,
+      payload_bytes: Buffer.byteLength(payload),
+      payload_snippet: truncateText(payload, POLICY_PAYLOAD_SNIPPET_LIMIT),
+    };
+
+    postPolicyHook(rule.hookUrl, event);
+  }
+}
+
+function createWebSocketLogWriter({ requestId, startTime, provider, endpoint, upstreamUrl }) {
   let sequence = 0;
   let clientFrames = 0;
   let serverFrames = 0;
@@ -585,6 +754,19 @@ function createWebSocketLogWriter(requestId, startTime) {
       frame.bytes,
       truncateText(frame.payload, WEBSOCKET_FRAME_PAYLOAD_LIMIT)
     );
+    const frameId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+    const directionName = direction === 'client' ? 'outbound' : 'inbound';
+    evaluatePolicyHooks({
+      requestId,
+      frameId,
+      provider,
+      endpoint,
+      upstreamUrl,
+      direction: directionName,
+      transport: 'websocket',
+      frame: { ...frame, sequence },
+      payload: frame.payload,
+    });
   };
 
   return {
@@ -648,7 +830,13 @@ function handleUpgrade(req, socket, head) {
   });
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
-    const wsLog = createWebSocketLogWriter(requestId, startTime);
+    const wsLog = createWebSocketLogWriter({
+      requestId,
+      startTime,
+      provider: provider.name,
+      endpoint: originalUrl,
+      upstreamUrl: upstreamUrl.toString(),
+    });
     wsLog.persist(upstreamRes.statusCode);
 
     socket.write(statusLine(req, upstreamRes.statusCode, upstreamRes.statusMessage));
@@ -802,6 +990,16 @@ app.get('/providers', (req, res) => {
   });
 });
 
+app.post('/api/policies/reload', (req, res) => {
+  const config = reloadPolicyConfig();
+  res.json({
+    source: config.source,
+    outbound_rules: config.outbound.length,
+    inbound_rules: config.inbound.length,
+    hook_url: POLICY_HOOK_URL,
+  });
+});
+
 app.use(async (req, res, next) => {
   if (req.path.startsWith('/api/') || req.path === '/health' || req.path === '/providers') {
     return next();
@@ -843,6 +1041,18 @@ app.use(async (req, res, next) => {
       signal: controller.signal,
     });
 
+    evaluatePolicyHooks({
+      requestId,
+      frameId: null,
+      provider: provider.name,
+      endpoint: req.originalUrl,
+      upstreamUrl,
+      direction: 'outbound',
+      transport: 'http',
+      frame: null,
+      payload: bodyText || '',
+    });
+
     clearTimeout(timeoutId);
     forwardResponseHeaders(upstream, res);
 
@@ -865,6 +1075,17 @@ app.use(async (req, res, next) => {
 
       res.end();
       const responseText = chunks.join('');
+      evaluatePolicyHooks({
+        requestId,
+        frameId: null,
+        provider: provider.name,
+        endpoint: req.originalUrl,
+        upstreamUrl,
+        direction: 'inbound',
+        transport: 'http-stream',
+        frame: null,
+        payload: responseText || '',
+      });
       const parsed = parseSSEStream(responseText);
       updateRequest({
         requestId,
@@ -878,6 +1099,17 @@ app.use(async (req, res, next) => {
     }
 
     const responseText = await upstream.text();
+    evaluatePolicyHooks({
+      requestId,
+      frameId: null,
+      provider: provider.name,
+      endpoint: req.originalUrl,
+      upstreamUrl,
+      direction: 'inbound',
+      transport: 'http',
+      frame: null,
+      payload: responseText || '',
+    });
     const usage = extractTokenUsage(responseText);
     updateRequest({
       requestId,
@@ -1124,4 +1356,5 @@ module.exports = {
   PROVIDERS,
   upstreamPathFor,
   buildUpstreamHeaders,
+  reloadPolicyConfig,
 };

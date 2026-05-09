@@ -72,6 +72,18 @@ Open `http://localhost:9999` for the request explorer.
 
 WebSocket upgrades are logged as one row in `requests`, with each decoded frame stored separately in `websocket_frames`. Request search includes WebSocket frame payloads and returns short matching snippets instead of embedding the full frame stream in the parent row.
 
+## Policy Hooks
+
+Copy `policies.example.json` to `policies.json` and edit the outbound/inbound regex rules. Matching request bodies, response bodies, and WebSocket frames are forwarded normally, but the proxy also POSTs a policy event to the configured hook URL.
+
+```bash
+cp policies.example.json policies.json
+npm run dev:hooks
+npm run dev
+```
+
+The default hook URL is `http://127.0.0.1:8888/hooks/policy`. Override it with `LLM_PROXY_POLICY_HOOK_URL`, or set `hook_url` per rule. The included hook server exposes `GET /events` and `GET /health`.
+
 For a provider-by-provider endpoint map, see [Provider Endpoint Coverage](docs/provider-endpoints.md).
 
 ## Tests
