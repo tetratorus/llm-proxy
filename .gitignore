@@ -6,3 +6,4 @@ requests.db-*
 *.sqlite
 *.sqlite-*
 .env
+touchid-trigger/touchid-trigger

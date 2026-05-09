@@ -252,7 +252,7 @@ test('policy hooks receive outbound and inbound websocket matches with context',
     req.on('end', () => {
       receivedHooks.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+      res.end(JSON.stringify({ allow: true, confirmed: true }));
     });
   });
   await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
@@ -325,6 +325,68 @@ test('policy hooks receive outbound and inbound websocket matches with context',
       process.env.OPENAI_API_KEY = previousKey;
     }
     for (const socket of upstreamSockets) socket.destroy();
+    await new Promise(resolve => upstream.close(resolve));
+    await new Promise(resolve => hookServer.close(resolve));
+    fs.rmSync(process.env.LLM_PROXY_POLICY_FILE, { force: true });
+    await fetch(`${baseUrl}/api/policies/reload`, { method: 'POST' });
+  }
+});
+
+test('policy hook denial blocks matching outbound HTTP requests', async () => {
+  const previousBase = PROVIDERS.openai.upstreamBase;
+  const previousKey = process.env.OPENAI_API_KEY;
+  const marker = `BLOCK_POLICY_${process.pid}_${Date.now()}`;
+  let upstreamSawRequest = false;
+
+  const hookServer = http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/hooks/policy') {
+      res.writeHead(404).end();
+      return;
+    }
+    req.resume();
+    req.on('end', () => {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ allow: false, reason: 'test policy denied' }));
+    });
+  });
+  await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
+  const hookUrl = `http://127.0.0.1:${hookServer.address().port}/hooks/policy`;
+
+  const upstream = http.createServer((req, res) => {
+    upstreamSawRequest = true;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+  });
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+
+  fs.writeFileSync(process.env.LLM_PROXY_POLICY_FILE, JSON.stringify({
+    outbound: [{ name: 'test-block-outbound', pattern: marker, hook_url: hookUrl }],
+    inbound: [],
+  }));
+  await fetch(`${baseUrl}/api/policies/reload`, { method: 'POST' });
+
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  process.env.OPENAI_API_KEY = 'test-env-http-key';
+
+  try {
+    const response = await fetch(`${baseUrl}/openai/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'test', messages: [{ role: 'user', content: marker }] }),
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 403);
+    assert.equal(body.error, 'Policy blocked outbound request');
+    assert.equal(body.reason, 'test policy denied');
+    assert.equal(upstreamSawRequest, false);
+  } finally {
+    PROVIDERS.openai.upstreamBase = previousBase;
+    if (previousKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousKey;
+    }
     await new Promise(resolve => upstream.close(resolve));
     await new Promise(resolve => hookServer.close(resolve));
     fs.rmSync(process.env.LLM_PROXY_POLICY_FILE, { force: true });

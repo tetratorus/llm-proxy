@@ -8,6 +8,7 @@
     "start:hooks": "pm2 start hook-server.js --name llm-proxy-hooks",
     "dev": "node server.js",
     "dev:hooks": "node hook-server.js",
+    "build:touchid": "cd touchid-trigger && go build -o touchid-trigger .",
     "test": "node --test test/*.test.js"
   },
   "keywords": [],

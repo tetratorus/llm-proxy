@@ -74,14 +74,17 @@ WebSocket upgrades are logged as one row in `requests`, with each decoded frame 
 
 ## Policy Hooks
 
-Edit `policies.json` to change the outbound/inbound regex rules. Matching request bodies, response bodies, and WebSocket frames are forwarded normally, but the proxy also POSTs a policy event to the configured hook URL.
+Edit `policies.json` to change the outbound/inbound regex rules. Matching request bodies, response bodies, and WebSocket frames block while the proxy POSTs a policy event to the configured hook URL. The hook must return JSON with `allow: true` before the proxy forwards the matching request, response, or frame.
 
 ```bash
+npm run build:touchid
 npm run dev:hooks
 npm run dev
 ```
 
 The default hook URL is `http://127.0.0.1:8888/hooks/policy`. Override it with `LLM_PROXY_POLICY_HOOK_URL`, or set `hook_url` per rule. The included hook server exposes `GET /events` and `GET /health`.
+
+The included hook server asks for local Touch ID confirmation. Its prompt includes the matched rule, direction, provider, endpoint, offending text, and surrounding payload snippet. If Touch ID is rejected, unavailable, or times out, the hook returns `allow: false` and the proxy blocks the matched traffic. The proxy waits up to `LLM_PROXY_POLICY_HOOK_TIMEOUT_MS` milliseconds for the hook, defaulting to 60000. The hook's Touch ID helper waits up to `HOOK_TOUCHID_TIMEOUT_MS`, defaulting to 55000.
 
 For a provider-by-provider endpoint map, see [Provider Endpoint Coverage](docs/provider-endpoints.md).
 

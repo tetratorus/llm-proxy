@@ -17,7 +17,7 @@ const WEBSOCKET_FRAME_PAYLOAD_LIMIT = Number(process.env.WEBSOCKET_FRAME_PAYLOAD
 const WEBSOCKET_SEARCH_SNIPPET_LIMIT = Number(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || 500);
 const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.json';
 const POLICY_HOOK_URL = process.env.LLM_PROXY_POLICY_HOOK_URL || 'http://127.0.0.1:8888/hooks/policy';
-const POLICY_HOOK_TIMEOUT = Number(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || 2000);
+const POLICY_HOOK_TIMEOUT = Number(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || 60000);
 const POLICY_PAYLOAD_SNIPPET_LIMIT = Number(process.env.LLM_PROXY_POLICY_SNIPPET_CHARS || 4000);
 
 const db = new Database(DB_PATH);
@@ -515,6 +515,14 @@ function createWebSocketFrameParser(onFrame) {
   let buffer = Buffer.alloc(0);
   let fragmentedOpcode = null;
   let fragmentedPayloads = [];
+  let fragmentedRawFrames = [];
+  let pending = Promise.resolve();
+
+  const emitFrame = frame => {
+    pending = pending.then(() => onFrame(frame)).catch(error => {
+      console.error('WebSocket frame handler error:', error);
+    });
+  };
 
   return chunk => {
     if (!chunk || !chunk.length) return;
@@ -548,6 +556,7 @@ function createWebSocketFrameParser(onFrame) {
       if (masked) offset += 4;
       if (buffer.length < offset + payloadLength) return;
 
+      const rawFrame = Buffer.from(buffer.subarray(0, offset + payloadLength));
       const payload = Buffer.from(buffer.subarray(offset, offset + payloadLength));
       if (masked) {
         const mask = buffer.subarray(maskOffset, maskOffset + 4);
@@ -560,35 +569,41 @@ function createWebSocketFrameParser(onFrame) {
 
       if (opcode === 0x0) {
         fragmentedPayloads.push(payload);
+        fragmentedRawFrames.push(rawFrame);
         if (fin && fragmentedOpcode !== null) {
           const completePayload = Buffer.concat(fragmentedPayloads);
-          onFrame({
+          emitFrame({
             opcode: fragmentedOpcode,
             type: decodeWebSocketOpcode(fragmentedOpcode),
             payload: readableFramePayload(fragmentedOpcode, completePayload),
             bytes: completePayload.length,
+            raw: Buffer.concat(fragmentedRawFrames),
           });
           fragmentedOpcode = null;
           fragmentedPayloads = [];
+          fragmentedRawFrames = [];
         }
       } else if (opcode === 0x1 || opcode === 0x2) {
         if (fin) {
-          onFrame({
+          emitFrame({
             opcode,
             type: decodeWebSocketOpcode(opcode),
             payload: readableFramePayload(opcode, payload),
             bytes: payload.length,
+            raw: rawFrame,
           });
         } else {
           fragmentedOpcode = opcode;
           fragmentedPayloads = [payload];
+          fragmentedRawFrames = [rawFrame];
         }
       } else {
-        onFrame({
+        emitFrame({
           opcode,
           type: decodeWebSocketOpcode(opcode),
           payload: readableFramePayload(opcode, payload),
           bytes: payload.length,
+          raw: rawFrame,
         });
       }
     }
@@ -636,47 +651,61 @@ function insertPolicyEvent({ requestId, frameId, direction, rule, hookUrl, statu
   );
 }
 
-function postPolicyHook(hookUrl, event) {
+async function postPolicyHook(hookUrl, event) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), POLICY_HOOK_TIMEOUT);
 
-  fetch(hookUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(event),
-    signal: controller.signal,
-  })
-    .then(response => {
-      clearTimeout(timeout);
-      insertPolicyEvent({
-        requestId: event.request_id,
-        frameId: event.frame_id,
-        direction: event.direction,
-        rule: event.rule,
-        hookUrl,
-        status: response.ok ? 'sent' : `http_${response.status}`,
-        error: null,
-        payloadSnippet: event.payload_snippet,
-      });
-    })
-    .catch(error => {
-      clearTimeout(timeout);
-      insertPolicyEvent({
-        requestId: event.request_id,
-        frameId: event.frame_id,
-        direction: event.direction,
-        rule: event.rule,
-        hookUrl,
-        status: 'failed',
-        error: error.message,
-        payloadSnippet: event.payload_snippet,
-      });
+  try {
+    const response = await fetch(hookUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(event),
+      signal: controller.signal,
     });
+
+    clearTimeout(timeout);
+    let body = {};
+    try {
+      body = await response.json();
+    } catch {
+      body = {};
+    }
+
+    const allowed = response.ok && body.allow === true;
+    insertPolicyEvent({
+      requestId: event.request_id,
+      frameId: event.frame_id,
+      direction: event.direction,
+      rule: event.rule,
+      hookUrl,
+      status: allowed ? 'allowed' : (response.ok ? 'denied' : `http_${response.status}`),
+      error: allowed ? null : (body.reason || body.error || null),
+      payloadSnippet: event.payload_snippet,
+    });
+
+    return {
+      allowed,
+      reason: body.reason || body.error || (allowed ? null : `Hook returned HTTP ${response.status}`),
+    };
+  } catch (error) {
+    clearTimeout(timeout);
+    insertPolicyEvent({
+      requestId: event.request_id,
+      frameId: event.frame_id,
+      direction: event.direction,
+      rule: event.rule,
+      hookUrl,
+      status: 'failed',
+      error: error.message,
+      payloadSnippet: event.payload_snippet,
+    });
+    return { allowed: false, reason: error.message };
+  }
 }
 
-function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, upstreamUrl, direction, transport, frame, payload }) {
+async function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, upstreamUrl, direction, transport, frame, payload }) {
   const rules = direction === 'outbound' ? policyConfig.outbound : policyConfig.inbound;
-  if (!rules.length || typeof payload !== 'string') return;
+  if (!rules.length || typeof payload !== 'string') return { allowed: true, matched: false };
 
   for (const rule of rules) {
     rule.regex.lastIndex = 0;
@@ -711,11 +740,30 @@ function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, upstreamU
       payload_snippet: truncateText(payload, POLICY_PAYLOAD_SNIPPET_LIMIT),
     };
 
-    postPolicyHook(rule.hookUrl, event);
+    const decision = await postPolicyHook(rule.hookUrl, event);
+    if (!decision.allowed) {
+      return {
+        allowed: false,
+        matched: true,
+        rule: rule.name,
+        reason: decision.reason || `Policy hook denied ${rule.name}`,
+      };
+    }
   }
+
+  return { allowed: true, matched: true };
 }
 
-function createWebSocketLogWriter({ requestId, startTime, provider, endpoint, upstreamUrl }) {
+function createWebSocketLogWriter({
+  requestId,
+  startTime,
+  provider,
+  endpoint,
+  upstreamUrl,
+  forwardClientFrame,
+  forwardServerFrame,
+  blockConnection,
+}) {
   let sequence = 0;
   let clientFrames = 0;
   let serverFrames = 0;
@@ -736,7 +784,7 @@ function createWebSocketLogWriter({ requestId, startTime, provider, endpoint, up
     });
   };
 
-  const record = (direction, frame) => {
+  const record = async (direction, frame) => {
     sequence += 1;
     if (direction === 'client') clientFrames += 1;
     if (direction === 'server') serverFrames += 1;
@@ -752,7 +800,7 @@ function createWebSocketLogWriter({ requestId, startTime, provider, endpoint, up
     );
     const frameId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
     const directionName = direction === 'client' ? 'outbound' : 'inbound';
-    evaluatePolicyHooks({
+    return evaluatePolicyHooks({
       requestId,
       frameId,
       provider,
@@ -766,13 +814,25 @@ function createWebSocketLogWriter({ requestId, startTime, provider, endpoint, up
   };
 
   return {
-    client: createWebSocketFrameParser(frame => {
-      record('client', frame);
+    client: createWebSocketFrameParser(async frame => {
+      const decision = await record('client', frame);
       persist(101);
+      if (decision.allowed) {
+        forwardClientFrame(frame.raw);
+      } else {
+        blockConnection(decision);
+      }
+      return decision;
     }),
-    server: createWebSocketFrameParser(frame => {
-      record('server', frame);
+    server: createWebSocketFrameParser(async frame => {
+      const decision = await record('server', frame);
       persist(101);
+      if (decision.allowed) {
+        forwardServerFrame(frame.raw);
+      } else {
+        blockConnection(decision);
+      }
+      return decision;
     }),
     persist,
   };
@@ -826,31 +886,44 @@ function handleUpgrade(req, socket, head) {
   });
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
+    let blocked = false;
+    const blockConnection = decision => {
+      if (blocked) return;
+      blocked = true;
+      const reason = decision.reason || `Policy hook denied ${decision.rule || 'matched rule'}`;
+      db.prepare('UPDATE requests SET response = ?, status_code = ?, response_time = ? WHERE id = ?')
+        .run(JSON.stringify({ error: 'Policy blocked WebSocket frame', reason }), 403, Date.now() - startTime, requestId);
+      console.error(`Policy blocked WebSocket request ${requestId}: ${reason}`);
+      socket.end();
+      upstreamSocket.end();
+    };
     const wsLog = createWebSocketLogWriter({
       requestId,
       startTime,
       provider: provider.name,
       endpoint: originalUrl,
       upstreamUrl: upstreamUrl.toString(),
+      forwardClientFrame: frame => {
+        if (!blocked) upstreamSocket.write(frame);
+      },
+      forwardServerFrame: frame => {
+        if (!blocked) socket.write(frame);
+      },
+      blockConnection,
     });
     wsLog.persist(upstreamRes.statusCode);
 
     socket.write(statusLine(req, upstreamRes.statusCode, upstreamRes.statusMessage));
     socket.write(rawHeaderLines(upstreamRes.rawHeaders, { preserveUpgradeHeaders: true }));
     socket.write('\r\n');
-    if (upstreamHead && upstreamHead.length) {
-      wsLog.server(upstreamHead);
-      socket.write(upstreamHead);
-    }
+    if (upstreamHead && upstreamHead.length) wsLog.server(upstreamHead);
     if (head && head.length) wsLog.client(head);
 
     socket.on('data', chunk => {
       wsLog.client(chunk);
-      upstreamSocket.write(chunk);
     });
     upstreamSocket.on('data', chunk => {
       wsLog.server(chunk);
-      socket.write(chunk);
     });
     socket.on('end', () => upstreamSocket.end());
     upstreamSocket.on('end', () => socket.end());
@@ -901,7 +974,6 @@ function handleUpgrade(req, socket, head) {
       JSON.stringify({ error: 'Proxy upgrade error', message: error.message }));
   });
 
-  if (head && head.length) upstreamReq.write(head);
   upstreamReq.end();
 }
 
@@ -1030,14 +1102,7 @@ app.use(async (req, res, next) => {
   const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
 
   try {
-    const upstream = await fetch(upstreamUrl, {
-      method: req.method,
-      headers: buildUpstreamHeaders(req, provider),
-      body: requestBody,
-      signal: controller.signal,
-    });
-
-    evaluatePolicyHooks({
+    const outboundDecision = await evaluatePolicyHooks({
       requestId,
       frameId: null,
       provider: provider.name,
@@ -1048,15 +1113,36 @@ app.use(async (req, res, next) => {
       frame: null,
       payload: bodyText || '',
     });
+    if (!outboundDecision.allowed) {
+      clearTimeout(timeoutId);
+      const responseText = JSON.stringify({
+        error: 'Policy blocked outbound request',
+        reason: outboundDecision.reason,
+      });
+      updateRequest({
+        requestId,
+        responseText,
+        statusCode: 403,
+        responseTime: Date.now() - startTime,
+        model: originalModel,
+        usage: null,
+      });
+      return res.status(403).json(JSON.parse(responseText));
+    }
+
+    const upstream = await fetch(upstreamUrl, {
+      method: req.method,
+      headers: buildUpstreamHeaders(req, provider),
+      body: requestBody,
+      signal: controller.signal,
+    });
 
     clearTimeout(timeoutId);
-    forwardResponseHeaders(upstream, res);
 
     const contentType = upstream.headers.get('content-type') || '';
     const isStream = contentType.includes('text/event-stream') || Boolean(req.body && req.body.stream);
 
     if (isStream && upstream.body) {
-      res.status(upstream.status);
       const chunks = [];
       const reader = upstream.body.getReader();
       const decoder = new TextDecoder();
@@ -1066,12 +1152,10 @@ app.use(async (req, res, next) => {
         if (done) break;
         const chunk = decoder.decode(value, { stream: true });
         chunks.push(chunk);
-        res.write(chunk);
       }
 
-      res.end();
       const responseText = chunks.join('');
-      evaluatePolicyHooks({
+      const inboundDecision = await evaluatePolicyHooks({
         requestId,
         frameId: null,
         provider: provider.name,
@@ -1082,6 +1166,22 @@ app.use(async (req, res, next) => {
         frame: null,
         payload: responseText || '',
       });
+      if (!inboundDecision.allowed) {
+        updateRequest({
+          requestId,
+          responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason }),
+          statusCode: 403,
+          responseTime: Date.now() - startTime,
+          model: originalModel,
+          usage: null,
+        });
+        return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason });
+      }
+
+      forwardResponseHeaders(upstream, res);
+      res.status(upstream.status);
+      for (const chunk of chunks) res.write(chunk);
+      res.end();
       const parsed = parseSSEStream(responseText);
       updateRequest({
         requestId,
@@ -1095,7 +1195,7 @@ app.use(async (req, res, next) => {
     }
 
     const responseText = await upstream.text();
-    evaluatePolicyHooks({
+    const inboundDecision = await evaluatePolicyHooks({
       requestId,
       frameId: null,
       provider: provider.name,
@@ -1106,6 +1206,19 @@ app.use(async (req, res, next) => {
       frame: null,
       payload: responseText || '',
     });
+    if (!inboundDecision.allowed) {
+      updateRequest({
+        requestId,
+        responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason }),
+        statusCode: 403,
+        responseTime: Date.now() - startTime,
+        model: originalModel,
+        usage: null,
+      });
+      return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason });
+    }
+
+    forwardResponseHeaders(upstream, res);
     const usage = extractTokenUsage(responseText);
     updateRequest({
       requestId,
