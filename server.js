@@ -214,25 +214,21 @@ function loadDotEnv(path = '.env') {
 }
 
 function loadPolicyConfig() {
-  const candidatePaths = [POLICY_FILE];
-  if (POLICY_FILE !== 'policies.example.json') candidatePaths.push('policies.example.json');
-
-  for (const path of candidatePaths) {
-    if (!fs.existsSync(path)) continue;
-    try {
-      const raw = JSON.parse(fs.readFileSync(path, 'utf8'));
-      return {
-        source: path,
-        outbound: compilePolicyRules(raw.outbound || []),
-        inbound: compilePolicyRules(raw.inbound || []),
-      };
-    } catch (error) {
-      console.error(`Failed to load policy file ${path}:`, error.message);
-      return { source: path, outbound: [], inbound: [] };
-    }
+  if (!fs.existsSync(POLICY_FILE)) {
+    return { source: null, outbound: [], inbound: [] };
   }
 
-  return { source: null, outbound: [], inbound: [] };
+  try {
+    const raw = JSON.parse(fs.readFileSync(POLICY_FILE, 'utf8'));
+    return {
+      source: POLICY_FILE,
+      outbound: compilePolicyRules(raw.outbound || []),
+      inbound: compilePolicyRules(raw.inbound || []),
+    };
+  } catch (error) {
+    console.error(`Failed to load policy file ${POLICY_FILE}:`, error.message);
+    return { source: POLICY_FILE, outbound: [], inbound: [] };
+  }
 }
 
 function compilePolicyRules(rules) {

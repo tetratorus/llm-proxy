@@ -74,10 +74,9 @@ WebSocket upgrades are logged as one row in `requests`, with each decoded frame 
 
 ## Policy Hooks
 
-Copy `policies.example.json` to `policies.json` and edit the outbound/inbound regex rules. Matching request bodies, response bodies, and WebSocket frames are forwarded normally, but the proxy also POSTs a policy event to the configured hook URL.
+Edit `policies.json` to change the outbound/inbound regex rules. Matching request bodies, response bodies, and WebSocket frames are forwarded normally, but the proxy also POSTs a policy event to the configured hook URL.
 
 ```bash
-cp policies.example.json policies.json
 npm run dev:hooks
 npm run dev
 ```
