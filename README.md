@@ -1,5 +1,7 @@
 # llm-proxy
 
+YOUTUBE DEMO HERE: https://www.youtube.com/watch?v=9JqcUp9iPNw&feature=youtu.be
+
 A local JavaScript proxy that sits in front of every LLM provider you use, logs each request to SQLite, and gates outbound/inbound traffic on regex policies that you can approve out-of-band — by Touch ID, voice, or anything you wire in.
 
 You point your SDK at `http://localhost:9999/<provider>` instead of the real upstream. The proxy logs the call, forwards it transparently, and — if a policy regex matches — pauses to ask a human before letting the bytes through.
