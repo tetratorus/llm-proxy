@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
+const toml = require('smol-toml');
 
 if (process.env.LLM_PROXY_SKIP_DOTENV !== '1') {
   loadDotEnv();
@@ -15,7 +16,7 @@ const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 300000);
 const DB_PATH = process.env.REQUESTS_DB || 'requests.db';
 const WEBSOCKET_FRAME_PAYLOAD_LIMIT = Number(process.env.WEBSOCKET_FRAME_PAYLOAD_LIMIT_CHARS || 1000000);
 const WEBSOCKET_SEARCH_SNIPPET_LIMIT = Number(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || 500);
-const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.json';
+const POLICY_FILE = process.env.LLM_PROXY_POLICY_FILE || 'policies.toml';
 const POLICY_HOOK_URL = process.env.LLM_PROXY_POLICY_HOOK_URL || 'http://127.0.0.1:8888/hooks/policy';
 const POLICY_HOOK_TIMEOUT = Number(process.env.LLM_PROXY_POLICY_HOOK_TIMEOUT_MS || 60000);
 const POLICY_PAYLOAD_SNIPPET_LIMIT = Number(process.env.LLM_PROXY_POLICY_SNIPPET_CHARS || 4000);
@@ -228,7 +229,8 @@ function loadPolicyConfig() {
   }
 
   try {
-    const raw = JSON.parse(fs.readFileSync(POLICY_FILE, 'utf8'));
+    const text = fs.readFileSync(POLICY_FILE, 'utf8');
+    const raw = POLICY_FILE.endsWith('.json') ? JSON.parse(text) : toml.parse(text);
     return {
       source: POLICY_FILE,
       outbound: compilePolicyRules(raw.outbound || []),

@@ -1,0 +1,27 @@
+# llm-proxy policies
+#
+# Each rule has a regex `pattern` and a `hook_url` that decides whether the
+# matched payload is allowed through. Hook contract:
+#   POST { rule, text, offending_text }
+#   200  { allow: true }                                  -> forward original
+#   403  { allow: false, redaction: "..." }               -> substitute and forward
+#
+# Hook server modes (HOOK_APPROVER env var overrides this):
+#   deny         # always deny + redact
+#   approve      # always allow, no prompt, no redaction
+#   touchid      # macOS Touch ID confirmation
+#   voice        # Gemini Live voice approval (needs GEMINI_API_KEY + sox)
+#   local_voice  # local LM Studio (Gemma) + ElevenLabs voice (needs LM Studio running + ELEVENLABS_API_KEY + sox)
+approver = "local_voice"
+
+[[outbound]]
+name = "outbound-credential-leak"
+pattern = '''[A-Z][A-Z0-9_]*_KEY\s*=\s*["']?[^"'\s]{12,}'''
+flags = "i"
+hook_url = "http://127.0.0.1:8888/hooks/policy"
+
+[[inbound]]
+name = "inbound-risky-shell-command"
+pattern = '''\brm\s+'''
+flags = "i"
+hook_url = "http://127.0.0.1:8888/hooks/policy"

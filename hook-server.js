@@ -3,12 +3,46 @@ const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { promisify } = require('util');
+const toml = require('smol-toml');
+const { approveByVoice } = require('./voice-approver');
+const { approveByLocalVoice } = require('./local-voice-approver');
 
 const app = express();
+
+function loadPolicyApprover() {
+  const file = process.env.LLM_PROXY_POLICY_FILE || path.join(__dirname, 'policies.toml');
+  try {
+    const parsed = toml.parse(fs.readFileSync(file, 'utf8'));
+    if (typeof parsed.approver === 'string') return parsed.approver;
+  } catch (error) {
+    console.error(`failed to read approver from ${file}:`, error.message);
+  }
+  return null;
+}
+
+const APPROVER = (process.env.HOOK_APPROVER || loadPolicyApprover() || 'deny').toLowerCase();
 const PORT = Number(process.env.HOOK_PORT || 8888);
 const TOUCHID_TIMEOUT_MS = Number(process.env.HOOK_TOUCHID_TIMEOUT_MS || 55000);
 const TOUCHID_REASON_CHARS = Number(process.env.HOOK_TOUCHID_REASON_CHARS || 1800);
+const REDACTION = process.env.HOOK_REDACTION || '[REDACTED_BY_LLM_PROXY_POLICY]';
+const DECISIONS_LOG = process.env.HOOK_DECISIONS_LOG || path.join(__dirname, 'user_decisions.jsonl');
 const execFileAsync = promisify(execFile);
+
+function appendDecisionLog(event, decision) {
+  try {
+    const line = JSON.stringify({
+      timestamp: event.received_at,
+      approver: APPROVER,
+      rule: event.rule && event.rule.name,
+      context: event.text,
+      offending_text: event.offending_text,
+      decision: decision.allow ? 'approve' : 'deny',
+    }) + '\n';
+    fs.appendFileSync(DECISIONS_LOG, line);
+  } catch (error) {
+    console.error('failed to append user_decisions.jsonl:', error.message);
+  }
+}
 
 app.use(express.json({ limit: process.env.HOOK_BODY_LIMIT || '25mb' }));
 
@@ -16,6 +50,13 @@ const events = [];
 const maxEvents = Number(process.env.HOOK_MAX_EVENTS || 500);
 const decisionCache = new Map();
 const CACHE_TTL_MS = Number(process.env.HOOK_DECISION_CACHE_TTL_MS || 3600000);
+
+let approvalChain = Promise.resolve();
+function serializeApproval(fn) {
+  const next = approvalChain.then(() => fn(), () => fn());
+  approvalChain = next.catch(() => {});
+  return next;
+}
 
 function cacheKey(event) {
   return `${event.rule && event.rule.name ? event.rule.name : ''}::${event.offending_text || ''}`;
@@ -38,6 +79,7 @@ function setCached(key, decision) {
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
+    approver: APPROVER,
     events: events.length,
     timestamp: new Date().toISOString(),
   });
@@ -65,15 +107,23 @@ app.post('/hooks/policy', async (req, res) => {
   let decision = getCached(key);
   let cached = Boolean(decision);
   if (!decision) {
-    const prompt = buildTouchIDPrompt(event);
-    decision = await requestTouchID(prompt);
-    setCached(key, decision);
+    decision = await serializeApproval(async () => {
+      const recheck = getCached(key);
+      if (recheck) return recheck;
+      const result = await approve(event);
+      if (!result.error) {
+        setCached(key, result);
+        appendDecisionLog(event, result);
+      }
+      return result;
+    });
   }
   event.decision = decision;
   event.cached = cached;
 
   console.log(JSON.stringify({
     received_at: event.received_at,
+    approver: APPROVER,
     rule: event.rule && event.rule.name,
     offending_text: event.offending_text,
     allowed: decision.allow,
@@ -89,13 +139,40 @@ app.post('/hooks/policy', async (req, res) => {
   res.json(decision);
 });
 
-function buildTouchIDPrompt(event) {
-  const rule = event.rule && event.rule.name ? event.rule.name : 'unnamed rule';
-  const offending = truncate(stringOrEmpty(event.offending_text), 80);
-  return truncate(`${rule}: ${offending}`, TOUCHID_REASON_CHARS);
+async function approve(event) {
+  switch (APPROVER) {
+    case 'touchid':
+      return approveTouchID(event);
+    case 'voice':
+      return approveVoice(event);
+    case 'local_voice':
+      return approveLocalVoice(event);
+    case 'approve':
+      return approveAlways(event);
+    case 'deny':
+    default:
+      return approveDeny(event);
+  }
 }
 
-async function requestTouchID(prompt) {
+function approveDeny() {
+  return {
+    allow: false,
+    redaction: REDACTION,
+    reason: 'always-deny default policy',
+    comments: 'always-deny default policy',
+  };
+}
+
+function approveAlways() {
+  return {
+    allow: true,
+    comments: 'always-approve policy',
+  };
+}
+
+async function approveTouchID(event) {
+  const prompt = buildTouchIDPrompt(event);
   try {
     const { command, args, cwd } = touchIDCommand(prompt);
     const { stdout } = await execFileAsync(command, args, {
@@ -103,29 +180,86 @@ async function requestTouchID(prompt) {
       timeout: TOUCHID_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
     });
-    const response = parseTouchIDResponse(stdout);
+    const response = parseJsonOutput(stdout);
     if (response.confirmed === true) {
       return { allow: true, confirmed: true, comments: 'Touch ID confirmed' };
     }
     return {
       allow: false,
       confirmed: false,
-      redaction: '[REDACTED_BY_LLM_PROXY_POLICY]',
+      redaction: REDACTION,
       reason: response.error || 'Touch ID was not confirmed',
       comments: response.error || 'Touch ID was not confirmed',
     };
   } catch (error) {
-    const response = parseTouchIDResponse(error.stdout);
+    const response = parseJsonOutput(error.stdout);
     const message = response.error || error.message || 'Touch ID failed';
     return {
       allow: false,
       confirmed: false,
-      redaction: '[REDACTED_BY_LLM_PROXY_POLICY]',
+      redaction: REDACTION,
       reason: message,
       comments: message,
       error: message,
     };
   }
+}
+
+async function approveVoice(event) {
+  try {
+    const result = await approveByVoice(event);
+    if (result.decision === 'approve') {
+      return { allow: true, comments: result.reason || 'voice approved' };
+    }
+    return {
+      allow: false,
+      redaction: REDACTION,
+      reason: result.reason || 'voice denied',
+      comments: result.reason || 'voice denied',
+    };
+  } catch (error) {
+    return {
+      allow: false,
+      redaction: REDACTION,
+      reason: error.message || 'voice approver failed',
+      comments: error.message || 'voice approver failed',
+      error: error.message || 'voice approver failed',
+    };
+  }
+}
+
+async function approveLocalVoice(event) {
+  try {
+    const result = await approveByLocalVoice(event);
+    const base = {
+      surfaced_prompt: result.surfaced_prompt,
+      transcript: result.transcript,
+    };
+    if (result.decision === 'approve') {
+      return { allow: true, comments: result.reason || 'local voice approved', ...base };
+    }
+    return {
+      allow: false,
+      redaction: REDACTION,
+      reason: result.reason || 'local voice denied',
+      comments: result.reason || 'local voice denied',
+      ...base,
+    };
+  } catch (error) {
+    return {
+      allow: false,
+      redaction: REDACTION,
+      reason: error.message || 'local voice approver failed',
+      comments: error.message || 'local voice approver failed',
+      error: error.message || 'local voice approver failed',
+    };
+  }
+}
+
+function buildTouchIDPrompt(event) {
+  const rule = event.rule && event.rule.name ? event.rule.name : 'unnamed rule';
+  const offending = truncate(stringOrEmpty(event.offending_text), 80);
+  return truncate(`${rule}: ${offending}`, TOUCHID_REASON_CHARS);
 }
 
 function touchIDCommand(prompt) {
@@ -154,7 +288,7 @@ function touchIDCommand(prompt) {
   };
 }
 
-function parseTouchIDResponse(output) {
+function parseJsonOutput(output) {
   if (!output) return {};
   try {
     return JSON.parse(String(output).trim());
@@ -174,7 +308,7 @@ function stringOrEmpty(value) {
 
 function startHookServer(port = PORT) {
   return app.listen(port, () => {
-    console.log(`llm-proxy hook server running on http://localhost:${port}`);
+    console.log(`llm-proxy hook server running on http://localhost:${port} (approver=${APPROVER})`);
   });
 }
 

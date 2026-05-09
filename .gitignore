@@ -7,3 +7,4 @@ requests.db-*
 *.sqlite-*
 .env
 touchid-trigger/touchid-trigger
+user_decisions.jsonl
