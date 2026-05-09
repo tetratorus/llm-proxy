@@ -14,6 +14,26 @@ app.use(express.json({ limit: process.env.HOOK_BODY_LIMIT || '25mb' }));
 
 const events = [];
 const maxEvents = Number(process.env.HOOK_MAX_EVENTS || 500);
+const decisionCache = new Map();
+const CACHE_TTL_MS = Number(process.env.HOOK_DECISION_CACHE_TTL_MS || 3600000);
+
+function cacheKey(event) {
+  return `${event.rule && event.rule.name ? event.rule.name : ''}::${event.offending_text || ''}`;
+}
+
+function getCached(key) {
+  const entry = decisionCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.at > CACHE_TTL_MS) {
+    decisionCache.delete(key);
+    return null;
+  }
+  return entry.decision;
+}
+
+function setCached(key, decision) {
+  decisionCache.set(key, { decision, at: Date.now() });
+}
 
 app.get('/health', (req, res) => {
   res.json({
@@ -41,15 +61,23 @@ app.post('/hooks/policy', async (req, res) => {
   events.push(event);
   while (events.length > maxEvents) events.shift();
 
-  const prompt = buildTouchIDPrompt(event);
-  const decision = await requestTouchID(prompt);
+  const key = cacheKey(event);
+  let decision = getCached(key);
+  let cached = Boolean(decision);
+  if (!decision) {
+    const prompt = buildTouchIDPrompt(event);
+    decision = await requestTouchID(prompt);
+    setCached(key, decision);
+  }
   event.decision = decision;
+  event.cached = cached;
 
   console.log(JSON.stringify({
     received_at: event.received_at,
     rule: event.rule && event.rule.name,
     offending_text: event.offending_text,
     allowed: decision.allow,
+    cached,
     comments: decision.comments,
     error: decision.error,
   }));
@@ -62,17 +90,9 @@ app.post('/hooks/policy', async (req, res) => {
 });
 
 function buildTouchIDPrompt(event) {
-  const parts = [
-    `llm-proxy policy match: ${event.rule && event.rule.name ? event.rule.name : 'unnamed rule'}`,
-    `Offending text: ${stringOrEmpty(event.offending_text)}`,
-  ];
-
-  const text = stringOrEmpty(event.text);
-  if (text) {
-    parts.push(`Text: ${text}`);
-  }
-
-  return truncate(parts.join('\n'), TOUCHID_REASON_CHARS);
+  const rule = event.rule && event.rule.name ? event.rule.name : 'unnamed rule';
+  const offending = truncate(stringOrEmpty(event.offending_text), 80);
+  return truncate(`${rule}: ${offending}`, TOUCHID_REASON_CHARS);
 }
 
 async function requestTouchID(prompt) {
@@ -90,6 +110,7 @@ async function requestTouchID(prompt) {
     return {
       allow: false,
       confirmed: false,
+      redaction: '[REDACTED_BY_LLM_PROXY_POLICY]',
       reason: response.error || 'Touch ID was not confirmed',
       comments: response.error || 'Touch ID was not confirmed',
     };
@@ -99,6 +120,7 @@ async function requestTouchID(prompt) {
     return {
       allow: false,
       confirmed: false,
+      redaction: '[REDACTED_BY_LLM_PROXY_POLICY]',
       reason: message,
       comments: message,
       error: message,

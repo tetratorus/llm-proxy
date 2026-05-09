@@ -16,6 +16,7 @@ const providerTests = [
     name: 'claude',
     requiredEnv: 'ANTHROPIC_API_KEY',
     paths: ['/claude/models', '/claude/v1/models'],
+    auth: () => ({ 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' }),
     validate: body => {
       assert.equal(body.data && Array.isArray(body.data), true);
     },
@@ -24,6 +25,7 @@ const providerTests = [
     name: 'openai',
     requiredEnv: 'OPENAI_API_KEY',
     paths: ['/openai/models', '/openai/v1/models'],
+    auth: () => ({ authorization: `Bearer ${process.env.OPENAI_API_KEY}` }),
     validate: body => {
       assert.equal(body.object, 'list');
       assert.equal(Array.isArray(body.data), true);
@@ -33,6 +35,7 @@ const providerTests = [
     name: 'deepseek',
     requiredEnv: 'DEEPSEEK_API_KEY',
     paths: ['/deepseek/models'],
+    auth: () => ({ authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}` }),
     validate: body => {
       assert.equal(body.object, 'list');
       assert.equal(Array.isArray(body.data), true);
@@ -42,6 +45,7 @@ const providerTests = [
     name: 'gemini',
     requiredEnv: 'GEMINI_API_KEY',
     paths: ['/gemini/models', '/gemini/v1beta/models'],
+    auth: () => ({ 'x-goog-api-key': process.env.GEMINI_API_KEY }),
     validate: body => {
       assert.equal(Array.isArray(body.models), true);
     },
@@ -50,6 +54,7 @@ const providerTests = [
     name: 'openrouter',
     requiredEnv: 'OPENROUTER_API_KEY',
     paths: ['/openrouter/models', '/openrouter/v1/models'],
+    auth: () => ({ authorization: `Bearer ${process.env.OPENROUTER_API_KEY}` }),
     validate: body => {
       assert.equal(Array.isArray(body.data), true);
     },
@@ -58,6 +63,7 @@ const providerTests = [
     name: 'xai',
     requiredEnv: 'XAI_API_KEY',
     paths: ['/xai/models', '/xai/v1/models'],
+    auth: () => ({ authorization: `Bearer ${process.env.XAI_API_KEY}` }),
     validate: body => {
       assert.equal(Array.isArray(body.data), true);
     },
@@ -90,7 +96,7 @@ for (const provider of providerTests) {
 
     for (const providerPath of provider.paths) {
       await t.test(providerPath, async () => {
-        const response = await fetch(`${baseUrl}${providerPath}`);
+        const response = await fetch(`${baseUrl}${providerPath}`, { headers: provider.auth() });
         const text = await response.text();
         const body = parseJson(text, provider.name, providerPath, response.status);
 
@@ -127,7 +133,7 @@ test('logged requests redact incoming auth headers', async () => {
   assert.equal(request.headers.authorization, '[REDACTED]');
 });
 
-test('provider env auth overrides incoming client auth', () => {
+test('client auth header passes through unchanged', () => {
   const previous = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = 'env-openai-key';
 
@@ -139,8 +145,8 @@ test('provider env auth overrides incoming client auth', () => {
       },
     }, { name: 'openai', config: PROVIDERS.openai });
 
-    assert.equal(headers.authorization, 'Bearer env-openai-key');
-    assert.equal(headers.Authorization, undefined);
+    assert.equal(headers.Authorization, 'Bearer client-key');
+    assert.equal(headers.authorization, undefined);
   } finally {
     if (previous === undefined) {
       delete process.env.OPENAI_API_KEY;
@@ -200,7 +206,7 @@ test('websocket frames are logged separately and searchable', async () => {
   const previousKey = process.env.OPENAI_API_KEY;
   const clientMarker = `client-ws-${process.pid}-${Date.now()}`;
   const serverMarker = `server-ws-${process.pid}-${Date.now()}`;
-  let upstreamSawEnvAuth = false;
+  let upstreamSawClientAuth = false;
   let upstreamSawCompression = false;
   const upstreamSockets = new Set();
 
@@ -208,7 +214,7 @@ test('websocket frames are logged separately and searchable', async () => {
   upstream.on('upgrade', (req, socket) => {
     upstreamSockets.add(socket);
     socket.on('close', () => upstreamSockets.delete(socket));
-    upstreamSawEnvAuth = req.headers.authorization === 'Bearer test-env-ws-key';
+    upstreamSawClientAuth = req.headers.authorization === 'Bearer client-key';
     upstreamSawCompression = Boolean(req.headers['sec-websocket-extensions']);
     socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
     socket.write(websocketTextFrame(JSON.stringify({ marker: serverMarker })));
@@ -251,7 +257,7 @@ test('websocket frames are logged separately and searchable', async () => {
       client.on('error', reject);
     });
 
-    assert.equal(upstreamSawEnvAuth, true);
+    assert.equal(upstreamSawClientAuth, true);
     assert.equal(upstreamSawCompression, false);
 
     const searchResponse = await fetch(`${baseUrl}/api/requests?search=${encodeURIComponent(clientMarker)}&limit=10`);
@@ -374,11 +380,12 @@ test('policy hooks receive outbound and inbound websocket matches with context',
   }
 });
 
-test('policy hook denial blocks matching outbound HTTP requests', async () => {
+test('policy hook denial redacts matched outbound HTTP body', async () => {
   const previousBase = PROVIDERS.openai.upstreamBase;
   const previousKey = process.env.OPENAI_API_KEY;
-  const marker = `BLOCK_POLICY_${process.pid}_${Date.now()}`;
-  let upstreamSawRequest = false;
+  const marker = `REDACT_POLICY_${process.pid}_${Date.now()}`;
+  const redactionText = `[REDACTED_${process.pid}]`;
+  let upstreamBody = null;
 
   const hookServer = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/hooks/policy') {
@@ -388,21 +395,30 @@ test('policy hook denial blocks matching outbound HTTP requests', async () => {
     req.resume();
     req.on('end', () => {
       res.writeHead(403, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ allow: false, reason: 'test policy denied', comments: 'test policy comment' }));
+      res.end(JSON.stringify({
+        allow: false,
+        reason: 'test policy denied',
+        comments: 'test policy comment',
+        redaction: redactionText,
+      }));
     });
   });
   await new Promise(resolve => hookServer.listen(0, '127.0.0.1', resolve));
   const hookUrl = `http://127.0.0.1:${hookServer.address().port}/hooks/policy`;
 
   const upstream = http.createServer((req, res) => {
-    upstreamSawRequest = true;
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true }));
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      upstreamBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
   });
   await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
 
   fs.writeFileSync(process.env.LLM_PROXY_POLICY_FILE, JSON.stringify({
-    outbound: [{ name: 'test-block-outbound', pattern: marker, hook_url: hookUrl }],
+    outbound: [{ name: 'test-redact-outbound', pattern: marker, hook_url: hookUrl }],
     inbound: [],
   }));
   await fetch(`${baseUrl}/api/policies/reload`, { method: 'POST' });
@@ -418,11 +434,11 @@ test('policy hook denial blocks matching outbound HTTP requests', async () => {
     });
     const body = await response.json();
 
-    assert.equal(response.status, 403);
-    assert.equal(body.error, 'Policy blocked outbound request');
-    assert.equal(body.reason, 'test policy denied');
-    assert.equal(body.comments, 'test policy comment');
-    assert.equal(upstreamSawRequest, false);
+    assert.equal(response.status, 200);
+    assert.equal(body.ok, true);
+    assert.ok(upstreamBody, 'expected upstream to receive request');
+    assert.equal(upstreamBody.includes(marker), false, 'marker should be redacted');
+    assert.equal(upstreamBody.includes(redactionText), true, 'redaction text should appear');
   } finally {
     PROVIDERS.openai.upstreamBase = previousBase;
     if (previousKey === undefined) {

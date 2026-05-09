@@ -28,48 +28,33 @@ const PROVIDERS = {
     aliases: ['anthropic'],
     upstreamBase: process.env.LLM_PROXY_CLAUDE_BASE_URL || 'https://api.anthropic.com',
     defaultPathPrefix: '/v1',
-    apiKeyEnv: 'ANTHROPIC_API_KEY',
-    authHeader: 'x-api-key',
-    extraHeaders: req => ({
-      'anthropic-version': req.headers['anthropic-version'] || '2023-06-01',
-    }),
   },
   openai: {
     upstreamBase: process.env.LLM_PROXY_OPENAI_BASE_URL || 'https://api.openai.com',
     defaultPathPrefix: '/v1',
-    apiKeyEnv: 'OPENAI_API_KEY',
-    authHeader: 'authorization',
+  },
+  codex: {
+    upstreamBase: process.env.LLM_PROXY_CODEX_BASE_URL || 'https://chatgpt.com',
+    defaultPathPrefix: '/backend-api/codex',
   },
   deepseek: {
     upstreamBase: process.env.LLM_PROXY_DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
     defaultPathPrefix: '',
-    apiKeyEnv: 'DEEPSEEK_API_KEY',
-    authHeader: 'authorization',
   },
   gemini: {
     aliases: ['google'],
     upstreamBase: process.env.LLM_PROXY_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com',
     defaultPathPrefix: '/v1beta',
     absolutePathPrefixes: ['/upload/'],
-    apiKeyEnv: 'GEMINI_API_KEY',
-    authHeader: 'x-goog-api-key',
   },
   openrouter: {
     upstreamBase: process.env.LLM_PROXY_OPENROUTER_BASE_URL || 'https://openrouter.ai/api',
     defaultPathPrefix: '/v1',
-    apiKeyEnv: 'OPENROUTER_API_KEY',
-    authHeader: 'authorization',
-    extraHeaders: () => ({
-      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'http://localhost:9999',
-      'X-Title': process.env.OPENROUTER_APP_NAME || 'llm-proxy',
-    }),
   },
   xai: {
     aliases: ['grok'],
     upstreamBase: process.env.LLM_PROXY_XAI_BASE_URL || 'https://api.x.ai',
     defaultPathPrefix: '/v1',
-    apiKeyEnv: 'XAI_API_KEY',
-    authHeader: 'authorization',
   },
 };
 
@@ -461,43 +446,10 @@ function shouldSkipHeader(header) {
   ].includes(header.toLowerCase());
 }
 
-function buildUpstreamHeaders(req, provider, options = {}) {
-  const headers = {};
-  const preserveUpgradeHeaders = Boolean(options.preserveUpgradeHeaders);
-  for (const [key, value] of Object.entries(req.headers)) {
-    const lowerKey = key.toLowerCase();
-    const isUpgradeHeader = lowerKey === 'connection' || lowerKey === 'upgrade';
-    if (shouldSkipHeader(key) && !(preserveUpgradeHeaders && isUpgradeHeader)) continue;
-    if (preserveUpgradeHeaders && lowerKey === 'sec-websocket-extensions') continue;
-    headers[key] = value;
-  }
-
-  headers.host = undefined;
-  headers['content-type'] = headers['content-type'] || 'application/json';
-
-  const apiKey = provider.config.apiKeyEnv ? process.env[provider.config.apiKeyEnv] : null;
-  if (apiKey && provider.config.authHeader) {
-    const authHeader = provider.config.authHeader;
-    for (const key of Object.keys(headers)) {
-      if (key.toLowerCase() === authHeader) delete headers[key];
-    }
-    if (authHeader === 'authorization') {
-      headers.authorization = `Bearer ${apiKey}`;
-    } else {
-      headers[authHeader] = apiKey;
-    }
-  }
-
-  Object.assign(headers, provider.config.extraHeaders ? provider.config.extraHeaders(req) : {});
-
-  if (Buffer.isBuffer(req.body) && req.headers['content-encoding']) {
-    headers['content-encoding'] = req.headers['content-encoding'];
-  }
-
-  for (const [key, value] of Object.entries(headers)) {
-    if (value === undefined) delete headers[key];
-  }
-
+function buildUpstreamHeaders(req) {
+  const headers = { ...req.headers };
+  delete headers['content-length'];
+  delete headers.host;
   return headers;
 }
 
@@ -537,6 +489,36 @@ function readableFramePayload(opcode, payload) {
     return `[binary base64] ${payload.toString('base64')}`;
   }
   return payload.length ? payload.toString('base64') : '';
+}
+
+function encodeWebSocketFrame({ opcode, payload, masked = false }) {
+  const payloadBuffer = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload || ''), 'utf8');
+  let lengthBytes;
+  if (payloadBuffer.length < 126) {
+    lengthBytes = Buffer.from([payloadBuffer.length]);
+  } else if (payloadBuffer.length <= 0xffff) {
+    lengthBytes = Buffer.from([126, payloadBuffer.length >> 8, payloadBuffer.length & 0xff]);
+  } else {
+    lengthBytes = Buffer.alloc(9);
+    lengthBytes[0] = 127;
+    lengthBytes.writeBigUInt64BE(BigInt(payloadBuffer.length), 1);
+  }
+
+  const firstByte = 0x80 | (opcode & 0x0f);
+  if (!masked) return Buffer.concat([Buffer.from([firstByte]), lengthBytes, payloadBuffer]);
+
+  lengthBytes[0] |= 0x80;
+  const mask = crypto.randomBytes(4);
+  const maskedPayload = Buffer.from(payloadBuffer);
+  for (let index = 0; index < maskedPayload.length; index += 1) {
+    maskedPayload[index] ^= mask[index % 4];
+  }
+  return Buffer.concat([Buffer.from([firstByte]), lengthBytes, mask, maskedPayload]);
+}
+
+function redactExactText(payload, offendingText, redaction) {
+  if (!offendingText) return payload;
+  return String(payload).split(offendingText).join(String(redaction || ''));
 }
 
 function createWebSocketFrameParser(onFrame) {
@@ -717,6 +699,7 @@ async function postPolicyHook(hookUrl, hookPayload) {
       allowed,
       reason: body.reason || body.error || (allowed ? null : `Hook returned HTTP ${response.status}`),
       comments: typeof body.comments === 'string' ? body.comments : null,
+      redaction: Object.prototype.hasOwnProperty.call(body, 'redaction') ? String(body.redaction) : null,
     };
   } catch (error) {
     clearTimeout(timeout);
@@ -728,17 +711,22 @@ async function postPolicyHook(hookUrl, hookPayload) {
       text: hookPayload.text,
       offendingText: hookPayload.offending_text,
     });
-    return { allowed: false, reason: error.message };
+    return { allowed: false, reason: error.message, redaction: null };
   }
 }
 
 async function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, upstreamUrl, direction, transport, frame, payload }) {
   const rules = direction === 'outbound' ? policyConfig.outbound : policyConfig.inbound;
-  if (!rules.length || typeof payload !== 'string') return { allowed: true, matched: false };
+  if (!rules.length || typeof payload !== 'string') {
+    return { allowed: true, matched: false, redacted: false, payload };
+  }
 
+  let currentPayload = payload;
+  let redacted = false;
+  const comments = [];
   for (const rule of rules) {
     rule.regex.lastIndex = 0;
-    const match = rule.regex.exec(payload);
+    const match = rule.regex.exec(currentPayload);
     if (!match) continue;
 
     const hookPayload = {
@@ -747,23 +735,34 @@ async function evaluatePolicyHooks({ requestId, frameId, provider, endpoint, ups
         pattern: rule.pattern,
         flags: rule.flags,
       },
-      text: payload,
+      text: currentPayload,
       offending_text: match[0],
     };
 
     const decision = await postPolicyHook(rule.hookUrl, hookPayload);
     if (!decision.allowed) {
-      return {
-        allowed: false,
-        matched: true,
-        rule: rule.name,
-        reason: decision.reason || `Policy hook denied ${rule.name}`,
-        comments: decision.comments || null,
-      };
+      if (decision.redaction !== null) {
+        currentPayload = redactExactText(currentPayload, match[0], decision.redaction);
+        redacted = true;
+      }
+      comments.push(decision.comments || decision.reason || `Policy hook denied ${rule.name}`);
     }
   }
 
-  return { allowed: true, matched: true };
+  return {
+    allowed: true,
+    matched: true,
+    redacted,
+    payload: currentPayload,
+    comments: comments.length ? comments.join('\n') : null,
+  };
+}
+
+function frameWireBytes(frame, decision, masked) {
+  if (decision.redacted && frame.opcode === 0x1) {
+    return encodeWebSocketFrame({ opcode: 0x1, payload: decision.payload, masked });
+  }
+  return frame.raw;
 }
 
 function createWebSocketLogWriter({
@@ -774,7 +773,6 @@ function createWebSocketLogWriter({
   upstreamUrl,
   forwardClientFrame,
   forwardServerFrame,
-  blockConnection,
 }) {
   let sequence = 0;
   let clientFrames = 0;
@@ -829,21 +827,13 @@ function createWebSocketLogWriter({
     client: createWebSocketFrameParser(async frame => {
       const decision = await record('client', frame);
       persist(101);
-      if (decision.allowed) {
-        forwardClientFrame(frame.raw);
-      } else {
-        blockConnection(decision);
-      }
+      forwardClientFrame(frameWireBytes(frame, decision, true));
       return decision;
     }),
     server: createWebSocketFrameParser(async frame => {
       const decision = await record('server', frame);
       persist(101);
-      if (decision.allowed) {
-        forwardServerFrame(frame.raw);
-      } else {
-        blockConnection(decision);
-      }
+      forwardServerFrame(frameWireBytes(frame, decision, false));
       return decision;
     }),
     persist,
@@ -888,40 +878,33 @@ function handleUpgrade(req, socket, head) {
 
   console.log(`Upgrade ${requestId} ${provider.name} ${req.method} ${originalUrl} -> ${upstreamUrl.toString()}`);
 
+  const rawUpstreamHeaders = ['Host', upstreamUrl.host];
+  for (let i = 0; i < req.rawHeaders.length; i += 2) {
+    const name = req.rawHeaders[i];
+    const lower = name.toLowerCase();
+    if (lower === 'host' || lower === 'content-length' || lower === 'sec-websocket-extensions') continue;
+    rawUpstreamHeaders.push(name, req.rawHeaders[i + 1]);
+  }
+
   const upstreamReq = protocol.request({
     protocol: upstreamUrl.protocol,
     hostname: upstreamUrl.hostname,
     port: upstreamUrl.port || undefined,
+    setHost: false,
     path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
     method: req.method,
-    headers: buildUpstreamHeaders(req, provider, { preserveUpgradeHeaders: true }),
+    headers: rawUpstreamHeaders,
   });
 
   upstreamReq.on('upgrade', (upstreamRes, upstreamSocket, upstreamHead) => {
-    let blocked = false;
-    const blockConnection = decision => {
-      if (blocked) return;
-      blocked = true;
-      const reason = decision.reason || `Policy hook denied ${decision.rule || 'matched rule'}`;
-      db.prepare('UPDATE requests SET response = ?, status_code = ?, response_time = ? WHERE id = ?')
-        .run(JSON.stringify({ error: 'Policy blocked WebSocket frame', reason, comments: decision.comments || null }), 403, Date.now() - startTime, requestId);
-      console.error(`Policy blocked WebSocket request ${requestId}: ${reason}`);
-      socket.end();
-      upstreamSocket.end();
-    };
     const wsLog = createWebSocketLogWriter({
       requestId,
       startTime,
       provider: provider.name,
       endpoint: originalUrl,
       upstreamUrl: upstreamUrl.toString(),
-      forwardClientFrame: frame => {
-        if (!blocked) upstreamSocket.write(frame);
-      },
-      forwardServerFrame: frame => {
-        if (!blocked) socket.write(frame);
-      },
-      blockConnection,
+      forwardClientFrame: frame => upstreamSocket.write(frame),
+      forwardServerFrame: frame => socket.write(frame),
     });
     wsLog.persist(upstreamRes.statusCode);
 
@@ -1004,6 +987,14 @@ function buildBody(req) {
   return JSON.stringify(req.body);
 }
 
+function buildBodyFromText(req, text) {
+  if (req.method === 'GET' || req.method === 'HEAD') return undefined;
+  if (Buffer.isBuffer(req.body)) return req.body;
+  if (typeof req.body === 'string') return text;
+  if (req.body === undefined) return undefined;
+  return text;
+}
+
 function insertRequest({ requestId, req, provider, upstreamUrl, bodyText, originalModel, conversationId }) {
   db.prepare(`
     INSERT INTO requests (
@@ -1064,7 +1055,6 @@ app.get('/providers', (req, res) => {
         aliases: config.aliases || [],
         upstream_base: config.upstreamBase.replace(/\/\/[^/@]+@/, '//[REDACTED]@'),
         default_path_prefix: config.defaultPathPrefix || null,
-        api_key_env: config.apiKeyEnv || null,
       },
     ])),
   });
@@ -1095,7 +1085,6 @@ app.use(async (req, res, next) => {
   const providerPath = upstreamPathFor(provider.config, provider.providerPath);
   const upstreamUrl = joinUrl(provider.config.upstreamBase, providerPath) + (req.url.includes('?') ? `?${req.url.split('?').slice(1).join('?')}` : '');
   const originalModel = req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body.model : null;
-  const requestBody = buildBody(req);
   const bodyText = safeJson(req.body);
 
   insertRequest({
@@ -1125,27 +1114,12 @@ app.use(async (req, res, next) => {
       frame: null,
       payload: bodyText || '',
     });
-    if (!outboundDecision.allowed) {
-      clearTimeout(timeoutId);
-      const responseText = JSON.stringify({
-        error: 'Policy blocked outbound request',
-        reason: outboundDecision.reason,
-        comments: outboundDecision.comments || null,
-      });
-      updateRequest({
-        requestId,
-        responseText,
-        statusCode: 403,
-        responseTime: Date.now() - startTime,
-        model: originalModel,
-        usage: null,
-      });
-      return res.status(403).json(JSON.parse(responseText));
-    }
+    const outboundBodyText = outboundDecision.redacted ? outboundDecision.payload : bodyText;
+    const requestBody = buildBodyFromText(req, outboundBodyText);
 
     const upstream = await fetch(upstreamUrl, {
       method: req.method,
-      headers: buildUpstreamHeaders(req, provider),
+      headers: buildUpstreamHeaders(req),
       body: requestBody,
       signal: controller.signal,
     });
@@ -1179,21 +1153,11 @@ app.use(async (req, res, next) => {
         frame: null,
         payload: responseText || '',
       });
-      if (!inboundDecision.allowed) {
-        updateRequest({
-          requestId,
-          responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null }),
-          statusCode: 403,
-          responseTime: Date.now() - startTime,
-          model: originalModel,
-          usage: null,
-        });
-        return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null });
-      }
+      const inboundResponseText = inboundDecision.redacted ? inboundDecision.payload : responseText;
 
       forwardResponseHeaders(upstream, res);
       res.status(upstream.status);
-      for (const chunk of chunks) res.write(chunk);
+      res.write(inboundResponseText);
       res.end();
       const parsed = parseSSEStream(responseText);
       updateRequest({
@@ -1219,17 +1183,7 @@ app.use(async (req, res, next) => {
       frame: null,
       payload: responseText || '',
     });
-    if (!inboundDecision.allowed) {
-      updateRequest({
-        requestId,
-        responseText: JSON.stringify({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null }),
-        statusCode: 403,
-        responseTime: Date.now() - startTime,
-        model: originalModel,
-        usage: null,
-      });
-      return res.status(403).json({ error: 'Policy blocked inbound response', reason: inboundDecision.reason, comments: inboundDecision.comments || null });
-    }
+    const inboundResponseText = inboundDecision.redacted ? inboundDecision.payload : responseText;
 
     forwardResponseHeaders(upstream, res);
     const usage = extractTokenUsage(responseText);
@@ -1244,7 +1198,7 @@ app.use(async (req, res, next) => {
 
     res.status(upstream.status)
       .setHeader('content-type', contentType || 'application/json')
-      .send(responseText);
+      .send(inboundResponseText);
   } catch (error) {
     clearTimeout(timeoutId);
     const responseTime = Date.now() - startTime;
