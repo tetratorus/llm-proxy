@@ -52,6 +52,7 @@ Sources: Anthropic API reference index in `https://docs.anthropic.com/llms.txt`,
 Auth/header behavior:
 - Forwards `Authorization: Bearer $OPENAI_API_KEY` when set, overriding any incoming client auth for upstream OpenAI requests.
 - Supports JSON, streaming, multipart/file bodies, and WebSocket upgrades.
+- Decodes WebSocket frames into the `websocket_frames` table and keeps the parent request row as a lightweight connection summary.
 
 OpenAI’s API reference describes REST, streaming, and realtime APIs. The proxy does normal HTTP forwarding for these endpoint families:
 

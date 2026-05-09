@@ -13,7 +13,8 @@ const app = express();
 const PORT = Number(process.env.PORT || 9999);
 const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 300000);
 const DB_PATH = process.env.REQUESTS_DB || 'requests.db';
-const WEBSOCKET_LOG_LIMIT = Number(process.env.WEBSOCKET_LOG_LIMIT_CHARS || 5000000);
+const WEBSOCKET_FRAME_PAYLOAD_LIMIT = Number(process.env.WEBSOCKET_FRAME_PAYLOAD_LIMIT_CHARS || 1000000);
+const WEBSOCKET_SEARCH_SNIPPET_LIMIT = Number(process.env.WEBSOCKET_SEARCH_SNIPPET_LIMIT_CHARS || 500);
 
 const db = new Database(DB_PATH);
 
@@ -107,6 +108,26 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_provider ON requests(provider);
   CREATE INDEX IF NOT EXISTS idx_model ON requests(model);
 `);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS websocket_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    sequence INTEGER NOT NULL,
+    direction TEXT NOT NULL,
+    opcode INTEGER,
+    type TEXT,
+    bytes INTEGER,
+    payload TEXT,
+    FOREIGN KEY (request_id) REFERENCES requests(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_ws_frames_request ON websocket_frames(request_id, sequence);
+  CREATE INDEX IF NOT EXISTS idx_ws_frames_payload ON websocket_frames(payload);
+`);
+
+migrateInlineWebSocketFrames();
 
 app.use(express.json({ limit: '50mb', type: ['application/json', 'application/*+json'] }));
 app.use(express.text({ limit: '50mb', type: ['text/*', 'application/x-ndjson'] }));
@@ -251,6 +272,86 @@ function parseSSEStream(sseText) {
   }
 
   return { model, usage };
+}
+
+function truncateText(value, limit) {
+  if (typeof value !== 'string' || value.length <= limit) return value;
+  return `${value.slice(0, limit)}...[truncated ${value.length - limit} chars]`;
+}
+
+function parseJsonArray(value) {
+  if (!value || typeof value !== 'string' || value[0] !== '[') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function migrateInlineWebSocketFrames() {
+  const rows = db.prepare(`
+    SELECT id, body, response
+    FROM requests
+    WHERE method = 'GET'
+      AND status_code = 101
+      AND (
+        (body IS NOT NULL AND body LIKE '[{%')
+        OR (response IS NOT NULL AND response LIKE '[{%')
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM websocket_frames WHERE websocket_frames.request_id = requests.id
+      )
+  `).all();
+
+  if (!rows.length) return;
+
+  const insertFrame = db.prepare(`
+    INSERT INTO websocket_frames (
+      request_id, timestamp, sequence, direction, opcode, type, bytes, payload
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const updateRequestSummary = db.prepare(`
+    UPDATE requests
+    SET body = ?, response = ?
+    WHERE id = ?
+  `);
+
+  const migrate = db.transaction(rowsToMigrate => {
+    for (const row of rowsToMigrate) {
+      const frames = [
+        ...(parseJsonArray(row.body) || []),
+        ...(parseJsonArray(row.response) || []),
+      ].sort((left, right) => String(left.timestamp || '').localeCompare(String(right.timestamp || '')));
+
+      let sequence = 0;
+      const counts = { client: 0, server: 0 };
+      for (const frame of frames) {
+        sequence += 1;
+        const direction = frame.direction || 'unknown';
+        if (direction === 'client' || direction === 'server') counts[direction] += 1;
+        insertFrame.run(
+          row.id,
+          frame.timestamp || new Date().toISOString(),
+          sequence,
+          direction,
+          frame.opcode ?? null,
+          frame.type || null,
+          frame.bytes ?? Buffer.byteLength(String(frame.payload || '')),
+          truncateText(String(frame.payload || ''), WEBSOCKET_FRAME_PAYLOAD_LIMIT)
+        );
+      }
+
+      updateRequestSummary.run(
+        JSON.stringify({ websocket: true, frames: counts.client, log: 'See websocket_frames' }),
+        JSON.stringify({ websocket: true, frames: counts.server, log: 'See websocket_frames' }),
+        row.id
+      );
+    }
+  });
+
+  migrate(rows);
 }
 
 function shouldSkipHeader(header) {
@@ -427,56 +528,72 @@ function createWebSocketFrameParser(onFrame) {
   };
 }
 
-function updateWebSocketLog({ requestId, bodyText, responseText, statusCode, responseTime }) {
+function updateWebSocketStatus({ requestId, statusCode, responseTime }) {
+  db.prepare(`
+    UPDATE requests
+    SET status_code = ?, response_time = ?
+    WHERE id = ?
+  `).run(statusCode, responseTime, requestId);
+}
+
+function updateWebSocketSummary({ requestId, clientFrames, serverFrames, statusCode, responseTime }) {
   db.prepare(`
     UPDATE requests
     SET body = ?, response = ?, status_code = ?, response_time = ?
     WHERE id = ?
-  `).run(bodyText, responseText, statusCode, responseTime, requestId);
+  `).run(
+    JSON.stringify({ websocket: true, frames: clientFrames, log: 'See websocket_frames' }),
+    JSON.stringify({ websocket: true, frames: serverFrames, log: 'See websocket_frames' }),
+    statusCode,
+    responseTime,
+    requestId
+  );
 }
 
 function createWebSocketLogWriter(requestId, startTime) {
-  const clientFrames = [];
-  const serverFrames = [];
-
-  const serialize = frames => {
-    let text = JSON.stringify(frames);
-    while (text.length > WEBSOCKET_LOG_LIMIT && frames.length > 1) {
-      frames.shift();
-      text = JSON.stringify(frames);
-    }
-    return text;
-  };
+  let sequence = 0;
+  let clientFrames = 0;
+  let serverFrames = 0;
+  const insertFrame = db.prepare(`
+    INSERT INTO websocket_frames (
+      request_id, timestamp, sequence, direction, opcode, type, bytes, payload
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
 
   const persist = statusCode => {
-    updateWebSocketLog({
+    updateWebSocketSummary({
       requestId,
-      bodyText: serialize(clientFrames),
-      responseText: serialize(serverFrames),
+      clientFrames,
+      serverFrames,
       statusCode,
       responseTime: Date.now() - startTime,
     });
   };
 
+  const record = (direction, frame) => {
+    sequence += 1;
+    if (direction === 'client') clientFrames += 1;
+    if (direction === 'server') serverFrames += 1;
+    insertFrame.run(
+      requestId,
+      new Date().toISOString(),
+      sequence,
+      direction,
+      frame.opcode,
+      frame.type,
+      frame.bytes,
+      truncateText(frame.payload, WEBSOCKET_FRAME_PAYLOAD_LIMIT)
+    );
+  };
+
   return {
     client: createWebSocketFrameParser(frame => {
-      clientFrames.push({
-        timestamp: new Date().toISOString(),
-        direction: 'client',
-        type: frame.type,
-        bytes: frame.bytes,
-        payload: frame.payload,
-      });
+      record('client', frame);
       persist(101);
     }),
     server: createWebSocketFrameParser(frame => {
-      serverFrames.push({
-        timestamp: new Date().toISOString(),
-        direction: 'server',
-        type: frame.type,
-        bytes: frame.bytes,
-        payload: frame.payload,
-      });
+      record('server', frame);
       persist(101);
     }),
     persist,
@@ -588,14 +705,13 @@ function handleUpgrade(req, socket, head) {
   });
 
   upstreamReq.on('error', error => {
-    updateRequest({
+    updateWebSocketStatus({
       requestId,
-      responseText: JSON.stringify({ error: 'Proxy upgrade error', message: error.message }),
       statusCode: 502,
       responseTime: Date.now() - startTime,
-      model: null,
-      usage: null,
     });
+    db.prepare('UPDATE requests SET response = ? WHERE id = ?')
+      .run(JSON.stringify({ error: 'Proxy upgrade error', message: error.message }), requestId);
     console.error(`Upgrade error for request ${requestId}:`, error);
     socket.end('HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\n\r\n' +
       JSON.stringify({ error: 'Proxy upgrade error', message: error.message }));
@@ -807,20 +923,63 @@ app.get('/api/requests', (req, res) => {
         SELECT COUNT(*) AS total
         FROM requests
         WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ? OR body LIKE ? OR response LIKE ?
-      `).get(like, like, like, like, like).total;
+          OR EXISTS (
+            SELECT 1 FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id
+              AND websocket_frames.payload LIKE ?
+          )
+      `).get(like, like, like, like, like, like).total;
       requests = db.prepare(`
-        SELECT *, COALESCE(json_array_length(json_extract(body, '$.messages')), 0) AS message_count
+        SELECT
+          requests.*,
+          COALESCE(json_array_length(json_extract(requests.body, '$.messages')), 0) AS message_count,
+          (
+            SELECT COUNT(*)
+            FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id
+          ) AS websocket_frame_count,
+          (
+            SELECT json_group_array(json_object(
+              'sequence', sequence,
+              'timestamp', timestamp,
+              'direction', direction,
+              'type', type,
+              'bytes', bytes,
+              'snippet', substr(payload, max(1, instr(payload, ?) - 160), ?)
+            ))
+            FROM (
+              SELECT sequence, timestamp, direction, type, bytes, payload
+              FROM websocket_frames
+              WHERE websocket_frames.request_id = requests.id
+                AND payload LIKE ?
+              ORDER BY sequence
+              LIMIT 5
+            )
+          ) AS websocket_matches
         FROM requests
         WHERE endpoint LIKE ? OR provider LIKE ? OR model LIKE ? OR body LIKE ? OR response LIKE ?
-        ORDER BY timestamp DESC
+          OR EXISTS (
+            SELECT 1 FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id
+              AND websocket_frames.payload LIKE ?
+          )
+        ORDER BY requests.timestamp DESC
         LIMIT ? OFFSET ?
-      `).all(like, like, like, like, like, limit, offset);
+      `).all(search, WEBSOCKET_SEARCH_SNIPPET_LIMIT, like, like, like, like, like, like, like, limit, offset);
     } else {
       total = db.prepare('SELECT COUNT(*) AS total FROM requests').get().total;
       requests = db.prepare(`
-        SELECT *, COALESCE(json_array_length(json_extract(body, '$.messages')), 0) AS message_count
+        SELECT
+          requests.*,
+          COALESCE(json_array_length(json_extract(requests.body, '$.messages')), 0) AS message_count,
+          (
+            SELECT COUNT(*)
+            FROM websocket_frames
+            WHERE websocket_frames.request_id = requests.id
+          ) AS websocket_frame_count,
+          NULL AS websocket_matches
         FROM requests
-        ORDER BY timestamp DESC
+        ORDER BY requests.timestamp DESC
         LIMIT ? OFFSET ?
       `).all(limit, offset);
     }
@@ -840,12 +999,75 @@ app.get('/api/requests', (req, res) => {
 
 app.get('/api/requests/:id', (req, res) => {
   try {
-    const request = db.prepare('SELECT * FROM requests WHERE id = ?').get(req.params.id);
+    const request = db.prepare(`
+      SELECT
+        requests.*,
+        (
+          SELECT COUNT(*)
+          FROM websocket_frames
+          WHERE websocket_frames.request_id = requests.id
+        ) AS websocket_frame_count
+      FROM requests
+      WHERE id = ?
+    `).get(req.params.id);
     if (!request) return res.status(404).json({ error: 'Request not found' });
     res.json(parseRequestRow(request));
   } catch (error) {
     console.error('Error getting request:', error);
     res.status(500).json({ error: 'Failed to get request' });
+  }
+});
+
+app.get('/api/requests/:id/websocket-frames', (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 1000);
+    const offset = (page - 1) * limit;
+    const search = String(req.query.search || '').trim();
+    const request = db.prepare('SELECT id FROM requests WHERE id = ?').get(req.params.id);
+    if (!request) return res.status(404).json({ error: 'Request not found' });
+
+    let total;
+    let frames;
+    if (search) {
+      const like = `%${search}%`;
+      total = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM websocket_frames
+        WHERE request_id = ? AND payload LIKE ?
+      `).get(req.params.id, like).total;
+      frames = db.prepare(`
+        SELECT *
+        FROM websocket_frames
+        WHERE request_id = ? AND payload LIKE ?
+        ORDER BY sequence
+        LIMIT ? OFFSET ?
+      `).all(req.params.id, like, limit, offset);
+    } else {
+      total = db.prepare(`
+        SELECT COUNT(*) AS total
+        FROM websocket_frames
+        WHERE request_id = ?
+      `).get(req.params.id).total;
+      frames = db.prepare(`
+        SELECT *
+        FROM websocket_frames
+        WHERE request_id = ?
+        ORDER BY sequence
+        LIMIT ? OFFSET ?
+      `).all(req.params.id, limit, offset);
+    }
+
+    res.json({
+      frames,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    });
+  } catch (error) {
+    console.error('Error getting websocket frames:', error);
+    res.status(500).json({ error: 'Failed to get websocket frames' });
   }
 });
 
@@ -871,6 +1093,8 @@ function parseRequestRow(row) {
     body: parseMaybeJson(row.body),
     response: parseMaybeJson(row.response),
     message_count: row.message_count || 0,
+    websocket_frame_count: row.websocket_frame_count || 0,
+    websocket_matches: parseMaybeJson(row.websocket_matches) || [],
   };
 }
 

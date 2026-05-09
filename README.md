@@ -66,8 +66,11 @@ export LLM_PROXY_OPENAI_BASE_URL=https://api.openai.com
 - `GET /providers` - configured provider prefixes and upstreams
 - `GET /api/requests` - paginated request log
 - `GET /api/requests/:id` - one logged request
+- `GET /api/requests/:id/websocket-frames` - paginated WebSocket frame log for upgraded requests
 
 Open `http://localhost:9999` for the request explorer.
+
+WebSocket upgrades are logged as one row in `requests`, with each decoded frame stored separately in `websocket_frames`. Request search includes WebSocket frame payloads and returns short matching snippets instead of embedding the full frame stream in the parent row.
 
 For a provider-by-provider endpoint map, see [Provider Endpoint Coverage](docs/provider-endpoints.md).
 

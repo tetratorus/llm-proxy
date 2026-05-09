@@ -271,6 +271,75 @@
       white-space: nowrap;
     }
 
+    .websocket-panel {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg-primary);
+      margin-top: 12px;
+      overflow: hidden;
+    }
+
+    .websocket-toolbar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      padding: 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-secondary);
+    }
+
+    .websocket-toolbar input,
+    .websocket-toolbar select {
+      padding: 7px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-size: 13px;
+    }
+
+    .websocket-frame {
+      border-bottom: 1px solid var(--border);
+      padding: 12px;
+    }
+
+    .websocket-frame:last-child {
+      border-bottom: none;
+    }
+
+    .websocket-frame-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      margin-bottom: 8px;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    .websocket-payload {
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .websocket-match-snippet {
+      margin-top: 8px;
+      padding: 8px 10px;
+      background: var(--bg-primary);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-secondary);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     .metadata-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -838,6 +907,10 @@
           }
         }
       }
+      if (!preview && req.websocket_matches && req.websocket_matches.length > 0) {
+        const firstMatch = req.websocket_matches[0];
+        preview = `${firstMatch.direction || 'ws'} #${firstMatch.sequence}: ${firstMatch.snippet || ''}`.substring(0, 220);
+      }
 
       const contentId = `content-${req.id}`;
       const indentStyle = isChild ? 'margin-left: 32px; border-left: 2px solid var(--border); padding-left: 12px;' : '';
@@ -850,6 +923,7 @@
               <span class="model-badge">${req.model || req.original_model || 'unknown'}</span>
               <span class="status-badge ${statusClass}">${req.status_code || 'pending'}</span>
               ${messageCount > 0 ? `<span class="status-badge" style="background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border);">💬 ${messageCount} msg${messageCount !== 1 ? 's' : ''} (${turns} turn${turns !== 1 ? 's' : ''})</span>` : ''}
+              ${req.websocket_frame_count > 0 ? `<span class="status-badge" style="background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border);">WS ${req.websocket_frame_count}</span>` : ''}
               ${req.match_count > 0 ? `<span class="status-badge" style="background: var(--accent); color: white; border: 1px solid var(--accent);">🔍 ${req.match_count} match${req.match_count !== 1 ? 'es' : ''}</span>` : ''}
             </div>
             <div class="request-meta">
@@ -1014,6 +1088,26 @@
         }
       }
 
+      if (req.websocket_frame_count > 0) {
+        html += `
+          <h3 style="margin: 24px 0 12px 0;">WebSocket Frames</h3>
+          <div class="websocket-panel">
+            <div class="websocket-toolbar">
+              <span style="color: var(--text-secondary); font-size: 13px;">${req.websocket_frame_count} frame${req.websocket_frame_count !== 1 ? 's' : ''}</span>
+              <input type="text" id="wsSearchInput" placeholder="Search frames..." value="${escapeHtml(searchTerm || '')}" style="min-width: 220px;">
+              <select id="wsDirectionFilter">
+                <option value="">All directions</option>
+                <option value="client">Client</option>
+                <option value="server">Server</option>
+              </select>
+              <button id="wsSearchButton">Search</button>
+              <button id="wsClearButton">Clear</button>
+            </div>
+            <div id="websocketFrames" class="loading">Loading frames...</div>
+          </div>
+        `;
+      }
+
       document.getElementById('app').innerHTML = `<div class="detail-view">${html}</div>`;
 
       // Add back button listener - use browser back button
@@ -1032,6 +1126,10 @@
         document.getElementById('loadMorePrev').addEventListener('click', () => {
           loadMorePreviousHistory(req.id, req.navigation);
         });
+      }
+
+      if (req.websocket_frame_count > 0) {
+        initWebSocketFrames(req.id, searchTerm || '');
       }
 
       // Add search match navigation listeners
@@ -1109,6 +1207,138 @@
         // Navigate to first match on load
         setTimeout(() => navigateToMatch(0), 300);
       }
+    }
+
+    const websocketFrameState = {
+      requestId: null,
+      page: 1,
+      totalPages: 1,
+      search: '',
+      direction: '',
+      limit: 50,
+      frames: [],
+    };
+
+    function initWebSocketFrames(requestId, searchTerm = '') {
+      websocketFrameState.requestId = requestId;
+      websocketFrameState.page = 1;
+      websocketFrameState.totalPages = 1;
+      websocketFrameState.search = searchTerm;
+      websocketFrameState.direction = '';
+      websocketFrameState.frames = [];
+
+      const searchInput = document.getElementById('wsSearchInput');
+      const directionFilter = document.getElementById('wsDirectionFilter');
+      const searchButton = document.getElementById('wsSearchButton');
+      const clearButton = document.getElementById('wsClearButton');
+
+      const reload = () => {
+        websocketFrameState.page = 1;
+        websocketFrameState.search = searchInput ? searchInput.value.trim() : '';
+        websocketFrameState.direction = directionFilter ? directionFilter.value : '';
+        loadWebSocketFrames();
+      };
+
+      if (searchButton) searchButton.addEventListener('click', reload);
+      if (clearButton) {
+        clearButton.addEventListener('click', () => {
+          if (searchInput) searchInput.value = '';
+          if (directionFilter) directionFilter.value = '';
+          reload();
+        });
+      }
+      if (searchInput) {
+        searchInput.addEventListener('keypress', event => {
+          if (event.key === 'Enter') reload();
+        });
+      }
+      if (directionFilter) directionFilter.addEventListener('change', reload);
+
+      loadWebSocketFrames();
+    }
+
+    async function loadWebSocketFrames(page = websocketFrameState.page) {
+      const container = document.getElementById('websocketFrames');
+      if (!container || !websocketFrameState.requestId) return;
+
+      websocketFrameState.page = page;
+      container.innerHTML = '<div class="loading">Loading frames...</div>';
+
+      try {
+        const params = new URLSearchParams({
+          page: String(websocketFrameState.page),
+          limit: String(websocketFrameState.limit),
+        });
+        if (websocketFrameState.search) params.set('search', websocketFrameState.search);
+
+        const response = await fetch(`/api/requests/${websocketFrameState.requestId}/websocket-frames?${params}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+
+        websocketFrameState.totalPages = data.totalPages || 1;
+        websocketFrameState.frames = (data.frames || []).filter(frame => {
+          return !websocketFrameState.direction || frame.direction === websocketFrameState.direction;
+        });
+
+        renderWebSocketFrames(data.total || 0);
+      } catch (error) {
+        container.innerHTML = `<div class="empty">Failed to load WebSocket frames: ${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function renderWebSocketFrames(total) {
+      const container = document.getElementById('websocketFrames');
+      if (!container) return;
+
+      const frames = websocketFrameState.frames;
+      if (frames.length === 0) {
+        container.innerHTML = '<div class="empty">No matching WebSocket frames</div>';
+        return;
+      }
+
+      const frameHtml = frames.map(frame => renderWebSocketFrame(frame)).join('');
+      const pagination = `
+        <div class="pagination" style="margin: 0; padding: 12px; border-top: 1px solid var(--border);">
+          <button id="wsPrevPage" ${websocketFrameState.page <= 1 ? 'disabled' : ''}>Previous</button>
+          <span class="page-info">Page ${websocketFrameState.page} of ${websocketFrameState.totalPages} • ${total} matched</span>
+          <button id="wsNextPage" ${websocketFrameState.page >= websocketFrameState.totalPages ? 'disabled' : ''}>Next</button>
+        </div>
+      `;
+
+      container.innerHTML = `${frameHtml}${pagination}`;
+
+      const prev = document.getElementById('wsPrevPage');
+      const next = document.getElementById('wsNextPage');
+      if (prev && websocketFrameState.page > 1) {
+        prev.addEventListener('click', () => loadWebSocketFrames(websocketFrameState.page - 1));
+      }
+      if (next && websocketFrameState.page < websocketFrameState.totalPages) {
+        next.addEventListener('click', () => loadWebSocketFrames(websocketFrameState.page + 1));
+      }
+    }
+
+    function renderWebSocketFrame(frame) {
+      let payload = frame.payload || '';
+      if (websocketFrameState.search) {
+        payload = highlightSearchTerm(escapeHtml(payload), websocketFrameState.search);
+      } else {
+        payload = escapeHtml(payload);
+      }
+
+      return `
+        <div class="websocket-frame">
+          <div class="websocket-frame-header">
+            <div>
+              <span class="status-badge" style="background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border);">${escapeHtml(frame.direction || 'unknown')}</span>
+              <span>#${frame.sequence}</span>
+              <span>${escapeHtml(frame.type || 'frame')}</span>
+              <span>${(frame.bytes || 0).toLocaleString()} bytes</span>
+            </div>
+            <div>${new Date(frame.timestamp).toLocaleString()}</div>
+          </div>
+          <pre class="websocket-payload"><code>${payload}</code></pre>
+        </div>
+      `;
     }
 
     // Helper function to highlight search term in text

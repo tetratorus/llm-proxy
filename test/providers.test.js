@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -147,6 +149,90 @@ test('provider env auth overrides incoming client auth', () => {
   }
 });
 
+test('websocket frames are logged separately and searchable', async () => {
+  const previousBase = PROVIDERS.openai.upstreamBase;
+  const previousKey = process.env.OPENAI_API_KEY;
+  const clientMarker = `client-ws-${process.pid}-${Date.now()}`;
+  const serverMarker = `server-ws-${process.pid}-${Date.now()}`;
+  let upstreamSawEnvAuth = false;
+  let upstreamSawCompression = false;
+  const upstreamSockets = new Set();
+
+  const upstream = http.createServer();
+  upstream.on('upgrade', (req, socket) => {
+    upstreamSockets.add(socket);
+    socket.on('close', () => upstreamSockets.delete(socket));
+    upstreamSawEnvAuth = req.headers.authorization === 'Bearer test-env-ws-key';
+    upstreamSawCompression = Boolean(req.headers['sec-websocket-extensions']);
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    socket.write(websocketTextFrame(JSON.stringify({ marker: serverMarker })));
+    setTimeout(() => socket.end(), 50);
+  });
+
+  await new Promise(resolve => upstream.listen(0, '127.0.0.1', resolve));
+  PROVIDERS.openai.upstreamBase = `http://127.0.0.1:${upstream.address().port}`;
+  process.env.OPENAI_API_KEY = 'test-env-ws-key';
+
+  try {
+    let client;
+    await new Promise((resolve, reject) => {
+      client = net.connect(new URL(baseUrl).port, '127.0.0.1', () => {
+        client.write([
+          'GET /openai/realtime?model=test HTTP/1.1',
+          `Host: ${new URL(baseUrl).host}`,
+          'Connection: Upgrade',
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          'Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits',
+          'Authorization: Bearer client-key',
+          '',
+          '',
+        ].join('\r\n'));
+        setTimeout(() => {
+          client.write(websocketTextFrame(JSON.stringify({ marker: clientMarker }), true));
+        }, 25);
+      });
+      const timeout = setTimeout(() => {
+        client.destroy();
+        reject(new Error('timed out waiting for websocket test client to close'));
+      }, 2000);
+      setTimeout(() => {
+        clearTimeout(timeout);
+        client.destroy();
+        resolve();
+      }, 200);
+      client.on('error', reject);
+    });
+
+    assert.equal(upstreamSawEnvAuth, true);
+    assert.equal(upstreamSawCompression, false);
+
+    const searchResponse = await fetch(`${baseUrl}/api/requests?search=${encodeURIComponent(clientMarker)}&limit=10`);
+    assert.equal(searchResponse.status, 200);
+    const searchBody = await searchResponse.json();
+    assert.equal(searchBody.total, 1);
+    assert.equal(searchBody.requests[0].body.websocket, true);
+    assert.equal(searchBody.requests[0].websocket_frame_count >= 2, true);
+    assert.equal(searchBody.requests[0].websocket_matches.some(match => match.snippet.includes(clientMarker)), true);
+
+    const framesResponse = await fetch(`${baseUrl}/api/requests/${searchBody.requests[0].id}/websocket-frames?limit=10`);
+    assert.equal(framesResponse.status, 200);
+    const framesBody = await framesResponse.json();
+    assert.equal(framesBody.frames.some(frame => frame.direction === 'client' && frame.payload.includes(clientMarker)), true);
+    assert.equal(framesBody.frames.some(frame => frame.direction === 'server' && frame.payload.includes(serverMarker)), true);
+  } finally {
+    PROVIDERS.openai.upstreamBase = previousBase;
+    if (previousKey === undefined) {
+      delete process.env.OPENAI_API_KEY;
+    } else {
+      process.env.OPENAI_API_KEY = previousKey;
+    }
+    for (const socket of upstreamSockets) socket.destroy();
+    await new Promise(resolve => upstream.close(resolve));
+  }
+});
+
 test('.env loader overrides existing shell exports', () => {
   const envPath = path.join(os.tmpdir(), `llm-proxy-env-${process.pid}.env`);
   process.env.LLM_PROXY_ENV_PRIORITY_TEST = 'from-shell';
@@ -171,4 +257,23 @@ function parseJson(text, provider, providerPath, status) {
 
 function snippet(text) {
   return text.replace(/\s+/g, ' ').slice(0, 500);
+}
+
+function websocketTextFrame(text, masked = false) {
+  const payload = Buffer.from(text);
+  let length;
+  if (payload.length < 126) {
+    length = Buffer.from([payload.length]);
+  } else {
+    length = Buffer.from([126, payload.length >> 8, payload.length & 255]);
+  }
+  const header = Buffer.from([0x81, masked ? length[0] | 0x80 : length[0], ...length.subarray(1)]);
+  if (!masked) return Buffer.concat([header, payload]);
+
+  const mask = Buffer.from([1, 2, 3, 4]);
+  const maskedPayload = Buffer.from(payload);
+  for (let index = 0; index < maskedPayload.length; index += 1) {
+    maskedPayload[index] ^= mask[index % 4];
+  }
+  return Buffer.concat([header, mask, maskedPayload]);
 }
