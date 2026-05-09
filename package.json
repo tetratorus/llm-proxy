@@ -1,0 +1,18 @@
+{
+  "name": "llm-proxy",
+  "version": "1.0.0",
+  "description": "Generic request-logging proxy for LLM provider APIs",
+  "main": "server.js",
+  "scripts": {
+    "start": "pm2 start server.js --name llm-proxy",
+    "dev": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "express": "^5.1.0"
+  }
+}
